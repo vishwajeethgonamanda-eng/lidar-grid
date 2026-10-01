@@ -96,6 +96,32 @@ def test_boundary_points():
     assert np.sum(grid.coarse.count) == 2
 
 
+def test_exact_boundaries_counted_once():
+    """Points at both zone edges: 10 m (fine/coarse) and 100 m (coarse/out)."""
+    grid = VarResGrid(n_classes=3)
+    pts = np.array([
+        [9.999, 0.0, 0.0],    # just inside fine
+        [10.0, 0.0, 0.0],     # exactly on the seam -> coarse, NOT fine
+        [99.999, 0.0, 0.0],   # just inside coarse
+        [100.0, 0.0, 0.0],    # exactly at the limit -> out of range
+    ], dtype=np.float32)
+    labels = np.array([0, 1, 2, 0], dtype=np.int64)
+
+    grid.add_points(pts, labels)
+    stats = grid.stats()
+
+    # Every point lands in exactly one place
+    assert stats["in_fine"] == 1
+    assert stats["in_coarse"] == 2
+    assert stats["out_of_range"] == 1
+    assert stats["total_input"] == 4
+    assert stats["in_fine"] + stats["in_coarse"] + stats["out_of_range"] == 4
+
+    # The cell arrays agree with the stats (nothing dropped or doubled)
+    assert int(np.sum(grid.fine.count)) == 1
+    assert int(np.sum(grid.coarse.count)) == 2
+
+
 def test_edge_cases():
     grid = VarResGrid(n_classes=3)
 
