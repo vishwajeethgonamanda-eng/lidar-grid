@@ -105,3 +105,33 @@ def test_exact_seam_routing():
     # row = floor((0.0 + 100) / 0.5) = 200
     assert grid.coarse.count[200, 220] == 1
     assert np.isclose(grid.coarse.z_min[200, 220], 0.8)
+
+
+@pytest.mark.parametrize("radius", [10.0, 15.0, 30.0])
+def test_seam_kerb_height_variable_radii(radius):
+    rng = np.random.default_rng(42)
+    # 15 cm kerb spanning across r = radius line
+    n_pts = 4000
+    r_kerb = rng.uniform(radius - 0.3, radius + 0.3, size=n_pts)
+    theta_kerb = rng.uniform(-0.1, 0.1, size=n_pts)
+    x = r_kerb * np.cos(theta_kerb)
+    y = r_kerb * np.sin(theta_kerb)
+    z = rng.choice([0.0, 0.15], size=n_pts).astype(np.float32)
+    xyz = np.column_stack([x, y, z]).astype(np.float32)
+    labels = np.ones(n_pts, dtype=np.int64)
+
+    grid = VarResGrid(n_classes=3, fine_radius=radius)
+    grid.add_points(xyz, labels)
+
+    # Check kerb visibility on fine side: cells with count > 0 have z_max - z_min >= 0.14
+    fine_dz = grid.fine.z_max - grid.fine.z_min
+    fine_occupied = grid.fine.count > 0
+    fine_step_detected = np.any((fine_dz >= 0.14) & fine_occupied)
+    assert fine_step_detected, f"Kerb height not preserved on fine side for radius={radius}"
+
+    # Check kerb visibility on coarse side: cells with count > 0 have z_max - z_min >= 0.14
+    coarse_dz = grid.coarse.z_max - grid.coarse.z_min
+    coarse_occupied = grid.coarse.count > 0
+    coarse_step_detected = np.any((coarse_dz >= 0.14) & coarse_occupied)
+    assert coarse_step_detected, f"Kerb height not preserved on coarse side for radius={radius}"
+

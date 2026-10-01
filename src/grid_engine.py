@@ -1,15 +1,39 @@
-from typing import Dict, Any
+from typing import Any, Dict
 import numpy as np
+
+
+def stopping_distance(speed_mps: float, reaction_s: float = 1.0, decel: float = 6.0) -> float:
+    """Calculates stopping distance: v * reaction_s + v**2 / (2 * decel)."""
+    v = max(0.0, float(speed_mps))
+    d_reaction = v * float(reaction_s)
+    d_braking = (v ** 2) / (2.0 * float(decel))
+    return float(d_reaction + d_braking)
+
+
+def adaptive_fine_radius(speed_mps: float, r_min: float = 10.0, r_max: float = 30.0) -> float:
+    """Returns stopping distance clamped between r_min and r_max."""
+    d_stop = stopping_distance(speed_mps)
+    return float(np.clip(d_stop, float(r_min), float(r_max)))
 
 
 class GridZone:
     """Represents a dense 2.5D grid zone with per-cell statistics."""
 
-    def __init__(self, half_extent: float, cell_size: float, grid_size: int, n_classes: int):
+    def __init__(
+        self,
+        half_extent: float,
+        cell_size: float,
+        grid_size: int,
+        n_classes: int,
+        center_x: float = 0.0,
+        center_y: float = 0.0,
+    ):
         self.half_extent = float(half_extent)
         self.cell_size = float(cell_size)
         self.grid_size = int(grid_size)
         self.n_classes = int(n_classes)
+        self.center_x = float(center_x)
+        self.center_y = float(center_y)
         self.reset()
 
     def reset(self) -> None:
@@ -30,12 +54,12 @@ class GridZone:
         z = xyz[:, 2]
 
         col = np.clip(
-            np.floor((x + self.half_extent) / self.cell_size).astype(np.int64),
+            np.floor(((x - self.center_x) + self.half_extent) / self.cell_size).astype(np.int64),
             0,
             self.grid_size - 1,
         )
         row = np.clip(
-            np.floor((y + self.half_extent) / self.cell_size).astype(np.int64),
+            np.floor(((y - self.center_y) + self.half_extent) / self.cell_size).astype(np.int64),
             0,
             self.grid_size - 1,
         )
@@ -84,17 +108,36 @@ class GridZone:
 
 
 class VarResGrid:
-    """Variable-Resolution 2.5D LiDAR Grid Engine.
+    """Variable-Resolution 2.5D LiDAR Grid Engine with adjustable fine radius at constant memory.
 
-    - Fine zone:   r < 10 m,        5 cm cells, array 400 x 400 covering [-10, 10) m
-    - Coarse zone: 10 <= r < 100 m, 50 cm cells, array 400 x 400 covering [-100, 100) m
-    - Out of range: r >= 100 m
+    - Fine zone: Circle of fine_radius around (forward_offset, 0).
+                 Array remains 400 x 400, fine cell size = 2 * fine_radius / 400.
+    - Coarse zone: 50 cm cells, array 400 x 400 covering [-100, 100) m for all other points within 100m.
+    - Out of range: r_sensor >= 100 m
     """
 
-    def __init__(self, n_classes: int):
+    def __init__(self, n_classes: int, fine_radius: float = 10.0, forward_offset: float = 0.0):
         self.n_classes = int(n_classes)
-        self.fine = GridZone(half_extent=10.0, cell_size=0.05, grid_size=400, n_classes=self.n_classes)
-        self.coarse = GridZone(half_extent=100.0, cell_size=0.5, grid_size=400, n_classes=self.n_classes)
+        self.fine_radius = float(fine_radius)
+        self.forward_offset = float(forward_offset)
+        self.fine_cell_size = (2.0 * self.fine_radius) / 400.0
+
+        self.fine = GridZone(
+            half_extent=self.fine_radius,
+            cell_size=self.fine_cell_size,
+            grid_size=400,
+            n_classes=self.n_classes,
+            center_x=self.forward_offset,
+            center_y=0.0,
+        )
+        self.coarse = GridZone(
+            half_extent=100.0,
+            cell_size=0.5,
+            grid_size=400,
+            n_classes=self.n_classes,
+            center_x=0.0,
+            center_y=0.0,
+        )
         self._stats = {
             "in_fine": 0,
             "in_coarse": 0,
@@ -117,8 +160,8 @@ class VarResGrid:
         xyz = np.asarray(xyz, dtype=np.float32)
         labels = np.asarray(labels, dtype=np.int64)
 
-        if xyz.ndim == 1 and xyz.size == 3:
-            xyz = xyz.reshape(1, 3)
+        if xyz.ndim == 1 and xyz.size >= 3:
+            xyz = xyz.reshape(1, -1)
         if labels.ndim == 0:
             labels = labels.reshape(1)
 
@@ -126,12 +169,15 @@ class VarResGrid:
         if n_pts == 0:
             return
 
-        # Continuous point radius determines the zone
-        r = np.hypot(xyz[:, 0], xyz[:, 1])
+        x = xyz[:, 0]
+        y = xyz[:, 1]
 
-        mask_fine = r < 10.0
-        mask_coarse = (r >= 10.0) & (r < 100.0)
-        mask_out = r >= 100.0
+        r_sensor = np.hypot(x, y)
+        r_fine = np.hypot(x - self.forward_offset, y)
+
+        mask_fine = (r_fine < self.fine_radius) & (r_sensor < 100.0)
+        mask_coarse = (~mask_fine) & (r_sensor < 100.0)
+        mask_out = r_sensor >= 100.0
 
         n_fine = int(np.count_nonzero(mask_fine))
         n_coarse = int(np.count_nonzero(mask_coarse))
@@ -155,9 +201,7 @@ class VarResGrid:
         return self.fine.nbytes + self.coarse.nbytes
 
     def uniform_equivalent_bytes(self) -> int:
-        """Memory if same stats were stored in a uniform 5 cm grid over the 100 m radius.
-        Covering [-100, 100) m at 5 cm resolution yields 4000 x 4000 cells.
-        """
+        """Memory if same stats were stored in a uniform 5 cm grid over the 100 m radius."""
         bytes_per_cell = (
             self.fine.count.itemsize
             + self.fine.z_min.itemsize
