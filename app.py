@@ -456,7 +456,7 @@ def main():
         st.write(f"- **Active Focus Patches**: {n_patches}")
         if patches_enabled and result.get("candidates"):
             for idx, cand in enumerate(result["candidates"][:n_patches]):
-                st.write(f"  * Patch #{idx+1}: ({cand.x:.1f}m, {cand.y:.1f}m) | Risk: {cand.risk:.3f} | Cls: {cand.cls}")
+                st.write(f"  * Patch #{idx+1}: ({cand.x:.1f}m, {cand.y:.1f}m) | Risk: {cand.risk:.3f} | Cls: {cand.dominant_class}")
         st.write(f"- **In Fine Zone**: {stats['in_fine']:,} points")
         if "in_patch" in stats:
             st.write(f"- **In Focus Patches**: {stats['in_patch']:,} points")
