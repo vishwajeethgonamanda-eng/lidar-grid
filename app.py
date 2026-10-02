@@ -84,7 +84,8 @@ def render_composite_top_down(
     canvas_size: int = 800,
 ) -> np.ndarray:
     """Renders a composite top-down bird's-eye view where x is forward (pointing up)
-    and y is lateral (left to right), dynamically centering and scaling the fine zone fovea.
+    and y is lateral (left to right), dynamically centering and scaling the fine zone fovea
+    and rendering high-resolution risk-guided focus patches.
     """
     half_extent = 100.0  # 200m x 200m
     xs = np.linspace(half_extent - 0.125, -half_extent + 0.125, canvas_size, dtype=np.float32)
@@ -100,7 +101,85 @@ def render_composite_top_down(
     fine_mask = (R_fine < grid.fine_radius) & (R_sensor < 100.0)
     coarse_mask = (~fine_mask) & (R_sensor < 100.0)
 
-    # 1. Render Fine Zone
+    # 1. Render Coarse Zone
+    c_x = X[coarse_mask]
+    c_y = Y[coarse_mask]
+    c_col = np.clip(np.floor((c_x + 100.0) / 0.5).astype(np.int64), 0, 399)
+    c_row = np.clip(np.floor((c_y + 100.0) / 0.5).astype(np.int64), 0, 399)
+
+    if view_mode == "state":
+        c_st = trav.coarse.state[c_row, c_col]
+        c_cf = trav.coarse.confidence[c_row, c_col, None]
+
+        c_colors = np.zeros((len(c_st), 3), dtype=np.float32)
+        for st_val, col_val in STATE_COLORS.items():
+            mask = c_st == st_val
+            c_colors[mask] = col_val
+
+        c_non_empty = c_st != UNKNOWN
+        dimmed_c = c_colors[c_non_empty] * (0.3 + 0.7 * c_cf[c_non_empty]) + bg_color * (0.7 * (1.0 - c_cf[c_non_empty]))
+        c_colors[c_non_empty] = dimmed_c
+        img[coarse_mask] = c_colors
+    else:
+        c_dom = grid.coarse.dominant_label[c_row, c_col]
+        c_cnt = grid.coarse.count[c_row, c_col]
+        c_colors = np.zeros((len(c_dom), 3), dtype=np.float32)
+        for class_id, col_val in SEMANTIC_COLORS.items():
+            mask = (c_dom == class_id) & (c_cnt > 0)
+            c_colors[mask] = col_val
+        c_colors[c_cnt == 0] = bg_color
+        img[coarse_mask] = c_colors
+
+    # 2. Render Focus Patches (over coarse, outside fine)
+    if hasattr(grid, "patches") and grid.patches:
+        for idx, patch in enumerate(grid.patches):
+            p_mask = (
+                (np.abs(X - patch.center_x) <= patch.half_extent)
+                & (np.abs(Y - patch.center_y) <= patch.half_extent)
+                & (R_sensor < 100.0)
+                & (~fine_mask)
+            )
+            if not np.any(p_mask):
+                continue
+
+            p_x = X[p_mask]
+            p_y = Y[p_mask]
+            p_col = np.clip(
+                np.floor(((p_x - patch.center_x) + patch.half_extent) / patch.cell_size).astype(np.int64),
+                0,
+                patch.grid_size - 1,
+            )
+            p_row = np.clip(
+                np.floor(((p_y - patch.center_y) + patch.half_extent) / patch.cell_size).astype(np.int64),
+                0,
+                patch.grid_size - 1,
+            )
+
+            if view_mode == "state" and hasattr(trav, "patches") and idx < len(trav.patches):
+                p_trav = trav.patches[idx]
+                p_st = p_trav.state[p_row, p_col]
+                p_cf = p_trav.confidence[p_row, p_col, None]
+
+                p_colors = np.zeros((len(p_st), 3), dtype=np.float32)
+                for st_val, col_val in STATE_COLORS.items():
+                    mask = p_st == st_val
+                    p_colors[mask] = col_val
+
+                p_non_empty = p_st != UNKNOWN
+                dimmed_p = p_colors[p_non_empty] * (0.3 + 0.7 * p_cf[p_non_empty]) + bg_color * (0.7 * (1.0 - p_cf[p_non_empty]))
+                p_colors[p_non_empty] = dimmed_p
+                img[p_mask] = p_colors
+            else:
+                p_dom = patch.dominant_label[p_row, p_col]
+                p_cnt = patch.count[p_row, p_col]
+                p_colors = np.zeros((len(p_dom), 3), dtype=np.float32)
+                for class_id, col_val in SEMANTIC_COLORS.items():
+                    mask = (p_dom == class_id) & (p_cnt > 0)
+                    p_colors[mask] = col_val
+                p_colors[p_cnt == 0] = bg_color
+                img[p_mask] = p_colors
+
+    # 3. Render Fine Zone (highest priority)
     f_x = X[fine_mask]
     f_y = Y[fine_mask]
     f_col = np.clip(
@@ -137,40 +216,24 @@ def render_composite_top_down(
         f_colors[f_cnt == 0] = bg_color
         img[fine_mask] = f_colors
 
-    # 2. Render Coarse Zone
-    c_x = X[coarse_mask]
-    c_y = Y[coarse_mask]
-    c_col = np.clip(np.floor((c_x + 100.0) / 0.5).astype(np.int64), 0, 399)
-    c_row = np.clip(np.floor((c_y + 100.0) / 0.5).astype(np.int64), 0, 399)
+    # 4. Draw Focus Patch Outlines
+    if hasattr(grid, "patches") and grid.patches:
+        gold_color = np.array([255, 215, 0], dtype=np.float32)
+        for patch in grid.patches:
+            dx = np.abs(X - patch.center_x)
+            dy = np.abs(Y - patch.center_y)
+            on_edge = (
+                ((np.abs(dx - patch.half_extent) <= 0.35) & (dy <= patch.half_extent + 0.35))
+                | ((np.abs(dy - patch.half_extent) <= 0.35) & (dx <= patch.half_extent + 0.35))
+            )
+            outline_mask = on_edge & (R_sensor < 100.0) & (~fine_mask)
+            img[outline_mask] = img[outline_mask] * 0.25 + gold_color * 0.75
 
-    if view_mode == "state":
-        c_st = trav.coarse.state[c_row, c_col]
-        c_cf = trav.coarse.confidence[c_row, c_col, None]
-
-        c_colors = np.zeros((len(c_st), 3), dtype=np.float32)
-        for st_val, col_val in STATE_COLORS.items():
-            mask = c_st == st_val
-            c_colors[mask] = col_val
-
-        c_non_empty = c_st != UNKNOWN
-        dimmed_c = c_colors[c_non_empty] * (0.3 + 0.7 * c_cf[c_non_empty]) + bg_color * (0.7 * (1.0 - c_cf[c_non_empty]))
-        c_colors[c_non_empty] = dimmed_c
-        img[coarse_mask] = c_colors
-    else:
-        c_dom = grid.coarse.dominant_label[c_row, c_col]
-        c_cnt = grid.coarse.count[c_row, c_col]
-        c_colors = np.zeros((len(c_dom), 3), dtype=np.float32)
-        for class_id, col_val in SEMANTIC_COLORS.items():
-            mask = (c_dom == class_id) & (f_cnt if 'f_cnt' in locals() and False else c_cnt > 0)
-            c_colors[mask] = col_val
-        c_colors[c_cnt == 0] = bg_color
-        img[coarse_mask] = c_colors
-
-    # 3. Draw Adaptive Seam Circle at fine_radius boundary
+    # 5. Draw Adaptive Seam Circle at fine_radius boundary
     seam_ring = np.abs(R_fine - grid.fine_radius) <= 0.35
     img[seam_ring] = img[seam_ring] * 0.35 + np.array([70, 180, 255], dtype=np.float32) * 0.65
 
-    # 4. Sensor Marker at (0, 0)
+    # 6. Sensor Marker at (0, 0)
     center = canvas_size // 2
     img[center - 3 : center + 4, center - 1 : center + 2] = [255, 255, 255]
     img[center - 1 : center + 2, center - 3 : center + 4] = [255, 255, 255]
@@ -259,6 +322,14 @@ def main():
 
     fine_cell_size = (2.0 * fine_radius) / 400.0
 
+    # Risk Focus Patches Controls
+    st.sidebar.header("Focus Patches")
+    patches_enabled = st.sidebar.checkbox("Risk-Guided Focus Patches", value=True)
+    if patches_enabled:
+        k_patches = st.sidebar.slider("Max Patches (K)", min_value=1, max_value=8, value=4)
+    else:
+        k_patches = 0
+
     # Display Options
     st.sidebar.header("Display Options")
     view_mode = st.sidebar.radio(
@@ -287,21 +358,34 @@ def main():
         labels = remap_labels(raw_labels)
         xyz = scan[:, :3]
     else:
-        scan, labels = make_synthetic_scene(seed=42 + st.session_state.frame_idx)
-        xyz = scan[:, :3]
+        from eval_patches import generate_patch_eval_scene
+        xyz, labels = generate_patch_eval_scene(seed=42 + st.session_state.frame_idx)
 
-    # Process Frame through Pipeline with dynamic grid
-    grid = VarResGrid(n_classes=8, fine_radius=fine_radius, forward_offset=0.0)
-    result = process_frame(xyz, labels, grid=grid, params=params)
+    # Process Frame through Pipeline with dynamic grid and optional risk patches
+    base_grid = VarResGrid(n_classes=8, fine_radius=fine_radius, forward_offset=0.0)
+    result = process_frame(
+        xyz,
+        labels,
+        grid=base_grid,
+        params=params,
+        risk_patches=patches_enabled,
+        speed_mps=speed_mps,
+        k_patches=k_patches,
+    )
+    grid = result["grid"]
     trav = result["traversability"]
     timings = result["timings"]
     stats = result["stats"]
     mem_var = result["memory_bytes"]
     mem_uni = result["uniform_equivalent_bytes"]
+    extra_mem_kb = result.get("extra_memory_bytes", 0) / 1024.0
+    n_patches = len(grid.patches) if hasattr(grid, "patches") else 0
 
     total_time_ms = max(timings["total_ms"], 0.001)
     fps = 1000.0 / total_time_ms
-    dropped_points = stats["total_input"] - (stats["in_fine"] + stats["in_coarse"] + stats["out_of_range"])
+    dropped_points = stats["total_input"] - (
+        stats["in_fine"] + stats.get("in_patch", 0) + stats["in_coarse"] + stats["out_of_range"]
+    )
     compression_ratio = mem_uni / mem_var
 
     # Live Counters & Telemetry Bar
@@ -309,7 +393,11 @@ def main():
     c1.metric("Pipeline FPS", f"{fps:.1f}", f"{total_time_ms:.1f} ms")
     c2.metric("Fine Radius", f"{fine_radius:.1f} m", f"Cell: {fine_cell_size * 100:.1f} cm")
     c3.metric("Stopping Dist", f"{d_stop:.1f} m", f"{speed_mps * 3.6:.1f} km/h")
-    c4.metric("VarRes Memory", f"{mem_var / (1024*1024):.2f} MB", "Constant")
+    c4.metric(
+        "VarRes Memory",
+        f"{mem_var / (1024*1024):.2f} MB",
+        f"+{extra_mem_kb:.0f} KB ({n_patches} Patches)" if (patches_enabled and n_patches > 0) else "Constant",
+    )
     c5.metric("Compression", f"{compression_ratio:.1f}x", f"vs {mem_uni / (1024*1024):.0f} MB")
     c6.metric("Dropped Points", f"{dropped_points}", delta="100% Conserved")
 
@@ -320,9 +408,14 @@ def main():
         st.subheader("2.5D Top-Down Composite Grid (Forward is Up)")
         mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
         map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
+        caption_text = f"200m x 200m Composite Map (Cyan Ring: {fine_radius:.1f}m Fine Seam, Cell: {fine_cell_size*100:.1f}cm"
+        if patches_enabled and n_patches > 0:
+            caption_text += f" | Gold Rects: {n_patches} Focus Patches @ 5cm)"
+        else:
+            caption_text += ")"
         st.image(
             map_img,
-            caption=f"200m x 200m Composite Map (Cyan Ring: {fine_radius:.1f}m Fine Seam, Cell: {fine_cell_size*100:.1f}cm)",
+            caption=caption_text,
             use_container_width=True,
         )
 
@@ -335,6 +428,8 @@ def main():
                 - 🟠 **Non-Drivable**: Step/slope limit or non-drivable ground
                 - 🔴 **Obstacle**: Static obstacle, vehicle, person
                 - ⬛ **Unknown**: Unobserved empty cell
+                - 🟨 **Gold Box**: 64x64 @ 5cm Risk Focus Patch
+                - 🔵 **Cyan Ring**: Fine Zone Radius Seam
                 - *Dimming indicates low observation confidence.*
                 """
             )
@@ -348,6 +443,8 @@ def main():
                 - 🟧 **Person**: Class 5
                 - 🟥 **Moving Object**: Class 6
                 - 🟨 **Non-drivable Ground**: Class 7
+                - 🟨 **Gold Box**: 64x64 @ 5cm Risk Focus Patch
+                - 🔵 **Cyan Ring**: Fine Zone Radius Seam
                 """
             )
 
@@ -355,13 +452,20 @@ def main():
         st.markdown("### Frame Statistics")
         st.write(f"- **Vehicle Speed**: {speed_mps:.1f} m/s ({speed_mps * 3.6:.1f} km/h)")
         st.write(f"- **Stopping Distance**: {d_stop:.1f} m")
-        st.write(f"- **Fine Zone Radius**: {fine_radius:.1f} m")
-        st.write(f"- **Fine Cell Resolution**: {fine_cell_size * 100:.1f} cm")
+        st.write(f"- **Fine Zone Radius**: {fine_radius:.1f} m (Cell: {fine_cell_size * 100:.1f} cm)")
+        st.write(f"- **Active Focus Patches**: {n_patches}")
+        if patches_enabled and result.get("candidates"):
+            for idx, cand in enumerate(result["candidates"][:n_patches]):
+                st.write(f"  * Patch #{idx+1}: ({cand.x:.1f}m, {cand.y:.1f}m) | Risk: {cand.risk:.3f} | Cls: {cand.cls}")
         st.write(f"- **In Fine Zone**: {stats['in_fine']:,} points")
+        if "in_patch" in stats:
+            st.write(f"- **In Focus Patches**: {stats['in_patch']:,} points")
         st.write(f"- **In Coarse Zone**: {stats['in_coarse']:,} points")
         st.write(f"- **Out of Range (≥100m)**: {stats['out_of_range']:,} points")
         st.write(f"- **Grid Add Time**: {timings['add_points_ms']:.2f} ms")
         st.write(f"- **Traversability Time**: {timings['compute_traversability_ms']:.2f} ms")
+        if patches_enabled:
+            st.write(f"- **Extra Risk & Patch Latency**: {timings.get('extra_time_ms', 0.0):.2f} ms")
 
     # If playing, advance frame
     if st.session_state.playing:

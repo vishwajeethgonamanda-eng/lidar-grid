@@ -49,21 +49,29 @@ class TraversabilityResult:
 
 
 class TraversabilityMap:
-    """Traversability outputs across fine and coarse zones."""
+    """Traversability outputs across fine, coarse, and optional focus patch zones."""
 
-    def __init__(self, fine: TraversabilityResult, coarse: TraversabilityResult):
+    def __init__(
+        self,
+        fine: TraversabilityResult,
+        coarse: TraversabilityResult,
+        patches: Optional[List[TraversabilityResult]] = None,
+    ):
         self.fine = fine
         self.coarse = coarse
+        self.patches = patches if patches is not None else []
 
     def __iter__(self) -> Iterator[TraversabilityResult]:
         yield self.fine
         yield self.coarse
 
-    def __getitem__(self, item: str) -> TraversabilityResult:
+    def __getitem__(self, item: str) -> Union[TraversabilityResult, List[TraversabilityResult]]:
         if item == "fine":
             return self.fine
         if item == "coarse":
             return self.coarse
+        if item == "patches":
+            return self.patches
         raise KeyError(f"Invalid key for TraversabilityMap: {item}")
 
 
@@ -194,4 +202,9 @@ def compute_traversability(
     fine_res = _compute_zone_traversability(grid.fine, p, min_fine)
     coarse_res = _compute_zone_traversability(grid.coarse, p, min_coarse)
 
-    return TraversabilityMap(fine=fine_res, coarse=coarse_res)
+    patch_results = []
+    if hasattr(grid, "patches") and grid.patches:
+        for p_zone in grid.patches:
+            patch_results.append(_compute_zone_traversability(p_zone, p, min_fine))
+
+    return TraversabilityMap(fine=fine_res, coarse=coarse_res, patches=patch_results)
