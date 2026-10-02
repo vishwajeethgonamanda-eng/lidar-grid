@@ -1,7 +1,8 @@
 from pathlib import Path
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
 from src.grid_engine import (
@@ -238,7 +239,150 @@ def render_composite_top_down(
     img[center - 3 : center + 4, center - 1 : center + 2] = [255, 255, 255]
     img[center - 1 : center + 2, center - 3 : center + 4] = [255, 255, 255]
 
-    return np.clip(img, 0, 255).astype(np.uint8)
+    uint_img = np.clip(img, 0, 255).astype(np.uint8)
+
+    # 7. PIL Annotations: Range rings, fine-zone label, focus-patch labels, color legend
+    pil_img = Image.fromarray(uint_img)
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default(size=12)
+    font_bold = ImageFont.load_default(size=13)
+
+    # 7a. Thin, labelled range rings at 10, 30, 50, and 100 m
+    for r in [10, 30, 50, 100]:
+        r_px = int(r * 4.0)
+        draw.ellipse([(400 - r_px, 400 - r_px), (400 + r_px, 400 + r_px)], outline=(85, 92, 105), width=1)
+        draw.rectangle([(404, 400 - r_px - 14), (436, 400 - r_px - 2)], fill=(20, 22, 28, 200))
+        draw.text((406, 400 - r_px - 14), f"{r}m", fill=(175, 182, 195), font=font)
+
+    # 7b. Label on the blue fine-zone circle showing fine radius and fine cell size
+    fine_cy = int((100.0 - grid.forward_offset) * 4.0)
+    fine_r_px = int(grid.fine_radius * 4.0)
+    fine_label = f"fine zone, r = {grid.fine_radius:.0f} m, {grid.fine_cell_size * 100:.1f} cm cells"
+    fine_box_w = len(fine_label) * 7 + 12
+    fine_lbl_x = max(10, min(canvas_size - fine_box_w - 10, 400 - fine_box_w // 2))
+    fine_lbl_y = max(10, fine_cy - fine_r_px - 18)
+    draw.rectangle([(fine_lbl_x, fine_lbl_y), (fine_lbl_x + fine_box_w, fine_lbl_y + 16)], fill=(12, 24, 42, 230), outline=(70, 180, 255))
+    draw.text((fine_lbl_x + 6, fine_lbl_y + 1), fine_label, fill=(70, 210, 255), font=font)
+
+    # 7c. "focus patch" label next to yellow patch squares
+    if hasattr(grid, "patches") and grid.patches:
+        for patch in grid.patches:
+            px_max = int((patch.center_y + patch.half_extent + 100.0) * 4.0)
+            py_min = int((100.0 - (patch.center_x + patch.half_extent)) * 4.0)
+            tag_x = min(canvas_size - 90, px_max + 4)
+            tag_y = max(10, py_min - 2)
+            draw.rectangle([(tag_x, tag_y), (tag_x + 84, tag_y + 15)], fill=(25, 25, 12, 230), outline=(255, 215, 0))
+            draw.text((tag_x + 4, tag_y + 1), "focus patch", fill=(255, 215, 0), font=font)
+
+    # 7d. Small colour legend
+    draw.rectangle([(15, 15), (145, 110)], fill=(20, 22, 28, 220), outline=(75, 82, 95))
+    draw.text((22, 19), "Legend", fill=(230, 235, 240), font=font_bold)
+    legend_items = [
+        ("Drivable", (46, 204, 113)),
+        ("Non-drivable", (243, 156, 18)),
+        ("Obstacle", (231, 76, 60)),
+        ("Unknown", (55, 60, 70)),
+    ]
+    for i, (name, col) in enumerate(legend_items):
+        y_pos = 38 + i * 17
+        draw.rectangle([(22, y_pos), (32, y_pos + 10)], fill=col)
+        draw.text((38, y_pos - 1), name, fill=(210, 215, 225), font=font)
+
+    return np.asarray(pil_img)
+
+
+def render_raw_points(
+    xyz: np.ndarray,
+    labels: np.ndarray,
+    canvas_size: int = 800,
+) -> np.ndarray:
+    """Renders a fast top-down scatter of raw LiDAR points (x forward / up, y lateral)
+    with the exact same axes and range ([-100, 100] m) as the grid map.
+    Subsampled to at most 20,000 points.
+    """
+    bg_color = np.array([30, 32, 38], dtype=np.uint8)
+    img = np.full((canvas_size, canvas_size, 3), bg_color, dtype=np.uint8)
+
+    n_pts = len(xyz)
+    if n_pts == 0:
+        return img
+
+    if n_pts > 20000:
+        step = max(1, n_pts // 20000)
+        idx = np.arange(0, n_pts, step)[:20000]
+        sub_xyz = xyz[idx]
+        sub_lbls = labels[idx]
+    else:
+        sub_xyz = xyz
+        sub_lbls = labels
+
+    x = sub_xyz[:, 0]
+    y = sub_xyz[:, 1]
+    valid = (np.abs(x) <= 100.0) & (np.abs(y) <= 100.0)
+    x = x[valid]
+    y = y[valid]
+    sub_lbls = sub_lbls[valid]
+
+    px_row = np.clip(np.floor((100.0 - x) * 4.0).astype(np.int64), 0, canvas_size - 1)
+    py_col = np.clip(np.floor((y + 100.0) * 4.0).astype(np.int64), 0, canvas_size - 1)
+
+    palette = np.array([
+        [40, 40, 45],     # 0 Unlabeled
+        [52, 152, 219],   # 1 Road
+        [39, 174, 96],    # 2 Terrain
+        [149, 165, 166],  # 3 Static Obstacle
+        [155, 89, 182],   # 4 Vehicle
+        [230, 126, 34],   # 5 Person
+        [231, 76, 60],    # 6 Moving Object
+        [241, 196, 15],   # 7 Non-drivable Ground
+    ], dtype=np.uint8)
+
+    point_colors = palette[np.clip(sub_lbls, 0, 7)]
+
+    # Draw points with 2x2 splat for visibility
+    img[px_row, py_col] = point_colors
+    px_p1 = np.clip(px_row + 1, 0, canvas_size - 1)
+    py_p1 = np.clip(py_col + 1, 0, canvas_size - 1)
+    img[px_p1, py_col] = point_colors
+    img[px_row, py_p1] = point_colors
+    img[px_p1, py_p1] = point_colors
+
+    # Overlay range rings and annotations via PIL
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default(size=12)
+    font_bold = ImageFont.load_default(size=13)
+
+    # Range rings
+    for r in [10, 30, 50, 100]:
+        r_px = int(r * 4.0)
+        draw.ellipse([(400 - r_px, 400 - r_px), (400 + r_px, 400 + r_px)], outline=(85, 92, 105), width=1)
+        draw.rectangle([(404, 400 - r_px - 14), (436, 400 - r_px - 2)], fill=(20, 22, 28, 200))
+        draw.text((406, 400 - r_px - 14), f"{r}m", fill=(175, 182, 195), font=font)
+
+    # Sensor Crosshair at (400, 400)
+    center = canvas_size // 2
+    draw.line([(center - 4, center), (center + 4, center)], fill=(255, 255, 255), width=1)
+    draw.line([(center, center - 4), (center, center + 4)], fill=(255, 255, 255), width=1)
+
+    # Small legend for raw points
+    draw.rectangle([(15, 15), (150, 185)], fill=(20, 22, 28, 220), outline=(75, 82, 95))
+    draw.text((22, 19), "Raw Point Classes", fill=(230, 235, 240), font=font_bold)
+    labels_names = [
+        ("Road", (52, 152, 219)),
+        ("Terrain", (39, 174, 96)),
+        ("Obstacle", (149, 165, 166)),
+        ("Vehicle", (155, 89, 182)),
+        ("Person", (230, 126, 34)),
+        ("Moving", (231, 76, 60)),
+        ("Non-drivable", (241, 196, 15)),
+    ]
+    for i, (name, col) in enumerate(labels_names):
+        y_pos = 38 + i * 20
+        draw.rectangle([(22, y_pos), (32, y_pos + 11)], fill=col)
+        draw.text((38, y_pos - 1), name, fill=(205, 210, 220), font=font)
+
+    return np.asarray(pil_img)
 
 
 def main():
@@ -332,6 +476,11 @@ def main():
 
     # Display Options
     st.sidebar.header("Display Options")
+    view_layout = st.sidebar.radio(
+        "View Layout",
+        ["Grid map", "Raw points", "Side by side"],
+        index=0,
+    )
     view_mode = st.sidebar.radio(
         "Map Layer",
         ["Drivable State Map", "Semantic Class Map"],
@@ -405,18 +554,48 @@ def main():
     col_map, col_info = st.columns([3, 1])
 
     with col_map:
-        st.subheader("2.5D Top-Down Composite Grid (Forward is Up)")
         mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
         map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
-        caption_text = f"200m x 200m Composite Map (Cyan Ring: {fine_radius:.1f}m Fine Seam, Cell: {fine_cell_size*100:.1f}cm"
-        if patches_enabled and n_patches > 0:
-            caption_text += f" | Gold Rects: {n_patches} Focus Patches @ 5cm)"
-        else:
-            caption_text += ")"
-        st.image(
-            map_img,
-            caption=caption_text,
-            use_container_width=True,
+        raw_img = render_raw_points(xyz, labels, canvas_size=800) if view_layout in ("Raw points", "Side by side") else None
+
+        if view_layout == "Grid map":
+            st.subheader("2.5D Top-Down Composite Grid (Forward is Up)")
+            caption_text = f"200m x 200m Composite Map (Cyan Ring: {fine_radius:.1f}m Fine Seam, Cell: {fine_cell_size*100:.1f}cm"
+            if patches_enabled and n_patches > 0:
+                caption_text += f" | Gold Rects: {n_patches} Focus Patches @ 5cm)"
+            else:
+                caption_text += ")"
+            st.image(map_img, caption=caption_text, use_container_width=True)
+
+        elif view_layout == "Raw points":
+            st.subheader("Raw LiDAR Point Cloud (Forward is Up)")
+            st.image(raw_img, caption=f"200m x 200m Raw Points ({min(len(xyz), 20000):,} Subsampled Points, Semantic Classes)", use_container_width=True)
+
+        else:  # "Side by side"
+            st.subheader("Side-by-Side: Raw Points vs 2.5D Grid Map")
+            c_left, c_right = st.columns(2)
+            with c_left:
+                st.image(raw_img, caption=f"Raw Points (≤20,000 pts)", use_container_width=True)
+            with c_right:
+                caption_sub = f"2.5D Grid (Fovea r={fine_radius:.0f}m)"
+                if patches_enabled and n_patches > 0:
+                    caption_sub += f" + {n_patches} Patches"
+                st.image(map_img, caption=caption_sub, use_container_width=True)
+
+        # One-line frame comparison computed from current frame
+        num_raw = len(xyz)
+        non_empty_fine = int(np.count_nonzero(grid.fine.count > 0))
+        non_empty_coarse = int(np.count_nonzero(grid.coarse.count > 0))
+        non_empty_patches = int(sum(np.count_nonzero(p.count > 0) for p in grid.patches)) if hasattr(grid, "patches") else 0
+        total_non_empty = non_empty_fine + non_empty_coarse + non_empty_patches
+        mem_var_mb = grid.memory_bytes() / (1024.0 * 1024.0)
+        mem_uni_mb = grid.uniform_equivalent_bytes() / (1024.0 * 1024.0)
+        ratio = mem_uni_mb / max(0.001, mem_var_mb)
+
+        st.info(
+            f"**Frame Comparison:** {num_raw:,} raw points | "
+            f"{total_non_empty:,} non-empty grid cells | "
+            f"Variable Grid: {mem_var_mb:.2f} MB vs Uniform 5 cm Grid: {mem_uni_mb:.0f} MB ({ratio:.1f}x compression)"
         )
 
     with col_info:
