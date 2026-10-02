@@ -21,6 +21,7 @@ from src.traversability import (
 )
 from src.pipeline import process_frame
 from src.speed import get_speed
+from src.viz25d import build_25d_elevation_figure
 
 
 # Color palettes:
@@ -420,6 +421,14 @@ def main():
         st.session_state.playing = False
     if "frame_idx" not in st.session_state:
         st.session_state.frame_idx = 0
+    if "view_revision" not in st.session_state:
+        st.session_state.view_revision = 0
+    if "cached_25d_fig" not in st.session_state:
+        st.session_state.cached_25d_fig = None
+    if "cached_25d_diag" not in st.session_state:
+        st.session_state.cached_25d_diag = None
+    if "last_25d_frame" not in st.session_state:
+        st.session_state.last_25d_frame = -1
 
     col_btn1, col_btn2 = st.sidebar.columns(2)
     if col_btn1.button("Play" if not st.session_state.playing else "Pause"):
@@ -478,14 +487,37 @@ def main():
     st.sidebar.header("Display Options")
     view_layout = st.sidebar.radio(
         "View Layout",
-        ["Grid map", "Raw points", "Side by side"],
+        ["Grid map", "Raw points", "Side by side", "2.5D elevation map"],
         index=0,
     )
-    view_mode = st.sidebar.radio(
-        "Map Layer",
-        ["Drivable State Map", "Semantic Class Map"],
-        index=0,
-    )
+    if view_layout != "2.5D elevation map":
+        view_mode = st.sidebar.radio(
+            "Map Layer",
+            ["Drivable State Map", "Semantic Class Map"],
+            index=0,
+        )
+    else:
+        view_mode = "Drivable State Map"
+        st.sidebar.subheader("2.5D Elevation Map Options")
+        h_exaggeration = st.sidebar.slider(
+            "Height Exaggeration",
+            min_value=1.0,
+            max_value=10.0,
+            value=3.0,
+            step=0.5,
+            help="Exaggerates elevation to enhance ground slope and step visibility",
+        )
+        viz25d_color_by = st.sidebar.selectbox("Colour by", ["traversability", "semantic class", "height"])
+        draw_empty_cells = st.sidebar.checkbox("Draw Empty Cells (Faint)", value=False)
+        update_interval = st.sidebar.slider(
+            "Update Every N Frames",
+            min_value=1,
+            max_value=10,
+            value=3,
+            help="Controls 3D re-render frequency during playback",
+        )
+        if st.sidebar.button("Reset View (Chase Cam)"):
+            st.session_state.view_revision = st.session_state.get("view_revision", 0) + 1
 
     # Traversability Parameters
     st.sidebar.header("Traversability Parameters")
@@ -531,9 +563,34 @@ def main():
     extra_mem_kb = result.get("extra_memory_bytes", 0) / 1024.0
     n_patches = len(grid.patches) if hasattr(grid, "patches") else 0
 
-    mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
-    map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
-    raw_img = render_raw_points(xyz, labels, canvas_size=800) if view_layout in ("Raw points", "Side by side") else None
+    if view_layout == "2.5D elevation map":
+        need_3d_update = (
+            st.session_state.cached_25d_fig is None
+            or not st.session_state.playing
+            or (st.session_state.frame_idx - st.session_state.last_25d_frame >= update_interval)
+            or (st.session_state.frame_idx < st.session_state.last_25d_frame)
+        )
+        if need_3d_update:
+            t3d_0 = time.perf_counter()
+            fig_3d, diag_3d = build_25d_elevation_figure(
+                grid=grid,
+                trav=trav,
+                color_mode=viz25d_color_by,
+                height_exaggeration=h_exaggeration,
+                draw_empty=draw_empty_cells,
+                view_revision=st.session_state.view_revision,
+            )
+            t3d_1 = time.perf_counter()
+            diag_3d["render_ms"] = (t3d_1 - t3d_0) * 1000.0
+            st.session_state.cached_25d_fig = fig_3d
+            st.session_state.cached_25d_diag = diag_3d
+            st.session_state.last_25d_frame = st.session_state.frame_idx
+        map_img = None
+        raw_img = None
+    else:
+        mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
+        map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
+        raw_img = render_raw_points(xyz, labels, canvas_size=800) if view_layout in ("Raw points", "Side by side") else None
     t_e2e_end = time.perf_counter()
 
     pipe_time_ms = max(timings["total_ms"], 0.001)
@@ -578,7 +635,7 @@ def main():
             st.subheader("Raw LiDAR Point Cloud (Forward is Up)")
             st.image(raw_img, caption=f"200m x 200m Raw Points ({min(len(xyz), 20000):,} Subsampled Points, Semantic Classes)", use_container_width=True)
 
-        else:  # "Side by side"
+        elif view_layout == "Side by side":
             st.subheader("Side-by-Side: Raw Points vs 2.5D Grid Map")
             c_left, c_right = st.columns(2)
             with c_left:
@@ -588,6 +645,21 @@ def main():
                 if patches_enabled and n_patches > 0:
                     caption_sub += f" + {n_patches} Patches"
                 st.image(map_img, caption=caption_sub, use_container_width=True)
+
+        elif view_layout == "2.5D elevation map":
+            st.subheader(f"2.5D Elevation Map (Cells Only, Height Exaggeration {h_exaggeration:.1f}x)")
+            if st.session_state.cached_25d_fig is not None:
+                st.plotly_chart(st.session_state.cached_25d_fig, use_container_width=True)
+            diag = st.session_state.cached_25d_diag or {
+                "cells_drawn": 0, "n_fine": 0, "n_patches": 0, "n_coarse": 0, "render_ms": 0.0, "height_exaggeration": h_exaggeration
+            }
+            st.caption(
+                f"**2.5D Elevation Map** (Extruded Grid Cells Only, Never Raw Points) | "
+                f"Cells Drawn: {diag['cells_drawn']:,} (Fine: {diag['n_fine']:,}, Focus Patches: {diag['n_patches']:,}, Coarse: {diag['n_coarse']:,}) | "
+                f"Height Exaggeration: {diag['height_exaggeration']:.1f}x | "
+                f"3D Render Time: {diag['render_ms']:.1f} ms | "
+                f"Memory: Variable Grid {mem_var / (1024*1024):.2f} MB vs Uniform 5cm {mem_uni / (1024*1024):.0f} MB ({compression_ratio:.1f}x compression)"
+            )
 
         # One-line frame comparison computed from current frame
         num_raw = len(xyz)
@@ -607,7 +679,19 @@ def main():
 
     with col_info:
         st.subheader("Legend & Diagnostics")
-        if view_mode == "Drivable State Map":
+        if view_layout == "2.5D elevation map":
+            st.markdown(
+                """
+                - 🟢 **Drivable**: Smooth navigable surface
+                - 🟠 **Non-Drivable**: Step/slope violation
+                - 🔴 **Obstacle**: Vehicle, person, obstacle
+                - 🟦 **Cyan Box**: Ego Vehicle (4.5m x 1.8m)
+                - 🔵 **Cyan Ring**: Fine Zone Radius
+                - 🟨 **Gold Box**: 64x64 Focus Patch
+                - *Interactive 3D: Left-click drag to rotate, right-click to pan, scroll to zoom.*
+                """
+            )
+        elif view_mode == "Drivable State Map":
             st.markdown(
                 """
                 - 🟢 **Drivable**: Smooth surface
