@@ -97,10 +97,13 @@ def _compute_zone_traversability(
         return TraversabilityResult(state, confidence)
 
     # 1. Compute Confidence
-    c_count = np.clip(count.astype(np.float32) / float(min_points), 0.0, 1.0)
-    z_var_safe = np.maximum(0.0, zone.z_var.astype(np.float32))
-    p_var = 1.0 / (1.0 + z_var_safe / float(params.var_scale))
-    confidence[occupied] = (c_count * p_var)[occupied]
+    c_occ = count[occupied].astype(np.float32)
+    inv_c = 1.0 / count[occupied]
+    mean = zone.z_sum[occupied] * inv_c
+    mean_sq = zone.z_sq_sum[occupied] * inv_c
+    var_safe = np.maximum(0.0, mean_sq - mean * mean).astype(np.float32)
+    p_var = 1.0 / (1.0 + var_safe / np.float32(params.var_scale))
+    confidence[occupied] = np.clip(c_occ / float(min_points), 0.0, 1.0) * p_var
 
     # 2. Rule b: Dominant label in {3, 4, 5, 6} -> obstacle (3)
     dom_label = zone.dominant_label
@@ -115,41 +118,23 @@ def _compute_zone_traversability(
     too_high_step = (step_height > params.max_step) & candidates
 
     # 4. Rule d: Slope against 4 non-empty neighbours -> non-drivable (2)
-    z_m = zone.z_mean
-    dz_up = np.zeros(shape, dtype=np.float64)
-    dz_down = np.zeros(shape, dtype=np.float64)
-    dz_left = np.zeros(shape, dtype=np.float64)
-    dz_right = np.zeros(shape, dtype=np.float64)
+    thresh_dz = np.float32(zone.cell_size * np.tan(np.deg2rad(params.max_slope_deg)))
+    inv_count = np.zeros(shape, dtype=np.float32)
+    inv_count[occupied] = 1.0 / count[occupied]
+    z_m = (zone.z_sum * inv_count).astype(np.float32)
 
-    valid_up = np.zeros(shape, dtype=bool)
-    valid_down = np.zeros(shape, dtype=bool)
-    valid_left = np.zeros(shape, dtype=bool)
-    valid_right = np.zeros(shape, dtype=bool)
+    diff_v = np.abs(z_m[1:, :] - z_m[:-1, :])
+    both_v = (diff_v > thresh_dz) & occupied[1:, :] & occupied[:-1, :]
 
-    # Up: (r, c) vs (r-1, c)
-    dz_up[1:, :] = np.abs(z_m[1:, :] - z_m[:-1, :])
-    valid_up[1:, :] = occupied[1:, :] & occupied[:-1, :]
+    diff_h = np.abs(z_m[:, 1:] - z_m[:, :-1])
+    both_h = (diff_h > thresh_dz) & occupied[:, 1:] & occupied[:, :-1]
 
-    # Down: (r, c) vs (r+1, c)
-    dz_down[:-1, :] = np.abs(z_m[:-1, :] - z_m[1:, :])
-    valid_down[:-1, :] = occupied[:-1, :] & occupied[1:, :]
-
-    # Left: (r, c) vs (r, c-1)
-    dz_left[:, 1:] = np.abs(z_m[:, 1:] - z_m[:, :-1])
-    valid_left[:, 1:] = occupied[:, 1:] & occupied[:, :-1]
-
-    # Right: (r, c) vs (r, c+1)
-    dz_right[:, :-1] = np.abs(z_m[:, :-1] - z_m[:, 1:])
-    valid_right[:, :-1] = occupied[:, :-1] & occupied[:, 1:]
-
-    dz_up = np.where(valid_up, dz_up, 0.0)
-    dz_down = np.where(valid_down, dz_down, 0.0)
-    dz_left = np.where(valid_left, dz_left, 0.0)
-    dz_right = np.where(valid_right, dz_right, 0.0)
-
-    max_dz = np.maximum(np.maximum(dz_up, dz_down), np.maximum(dz_left, dz_right))
-    steepest_slope_deg = np.rad2deg(np.arctan(max_dz / zone.cell_size))
-    too_steep_slope = (steepest_slope_deg > params.max_slope_deg) & candidates
+    too_steep = np.zeros(shape, dtype=bool)
+    too_steep[1:, :] |= both_v
+    too_steep[:-1, :] |= both_v
+    too_steep[:, 1:] |= both_h
+    too_steep[:, :-1] |= both_h
+    too_steep_slope = too_steep & candidates
 
     # 5. Rule e: Dominant label 7 (non-drivable ground) or 2 (terrain unless terrain_is_drivable)
     if params.terrain_is_drivable:
@@ -177,12 +162,14 @@ def _compute_zone_traversability(
 def compute_traversability(
     grid: Any,
     params: Optional[Union[TraversabilityParams, Dict[str, Any]]] = None,
+    cached_fine: Optional[TraversabilityResult] = None,
 ) -> TraversabilityMap:
     """Computes 2.5D traversability states and confidences for VarResGrid zones.
 
     Args:
         grid: Instance of VarResGrid containing fine and coarse zones.
         params: Optional TraversabilityParams or dict of parameters.
+        cached_fine: Optional precomputed TraversabilityResult for the fine zone to avoid recomputation.
 
     Returns:
         TraversabilityMap containing `fine` and `coarse` TraversabilityResult objects,
@@ -199,7 +186,7 @@ def compute_traversability(
     min_fine = getattr(p, "min_points_fine", getattr(p, "min_points", 3))
     min_coarse = getattr(p, "min_points_coarse", getattr(p, "min_points", 5))
 
-    fine_res = _compute_zone_traversability(grid.fine, p, min_fine)
+    fine_res = cached_fine if cached_fine is not None else _compute_zone_traversability(grid.fine, p, min_fine)
     coarse_res = _compute_zone_traversability(grid.coarse, p, min_coarse)
 
     patch_results = []

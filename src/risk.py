@@ -42,6 +42,11 @@ CLASS_WEIGHTS = {
 }
 
 
+# Precomputed coarse grid cell center coordinates (metres)
+_COARSE_X = (-100.0 + (np.arange(400, dtype=np.float32) + 0.5) * 0.5)
+_COARSE_Y = (-100.0 + (np.arange(400, dtype=np.float32) + 0.5) * 0.5)[:, None]
+
+
 def compute_candidate_risks(
     grid: VarResGrid,
     speed_mps: float = 10.0,
@@ -74,9 +79,8 @@ def compute_candidate_risks(
     coarse = grid.coarse
     occupied = coarse.count > 0
 
-    # Grid cell coordinates in metres (400 x 400 covering [-100, 100) at 0.5 m)
-    grid_x = -100.0 + (np.tile(np.arange(400), (400, 1)) + 0.5) * 0.5
-    grid_y = -100.0 + (np.tile(np.arange(400)[:, None], (1, 400)) + 0.5) * 0.5
+    grid_x = _COARSE_X
+    grid_y = _COARSE_Y
 
     r_fine = np.hypot(grid_x - grid.forward_offset, grid_y)
     r_sensor = np.hypot(grid_x, grid_y)
@@ -95,11 +99,13 @@ def compute_candidate_risks(
     if np.any(target_mask):
         structure = ndimage.generate_binary_structure(2, 2)  # 8-connectivity
         labeled_arr, num_features = ndimage.label(target_mask, structure=structure)
+        full_x = np.broadcast_to(grid_x, (400, 400))
+        full_y = np.broadcast_to(grid_y, (400, 400))
 
         for feat_id in range(1, num_features + 1):
             feat_mask = labeled_arr == feat_id
-            cx = float(np.mean(grid_x[feat_mask]))
-            cy = float(np.mean(grid_y[feat_mask]))
+            cx = float(np.mean(full_x[feat_mask]))
+            cy = float(np.mean(full_y[feat_mask]))
 
             # Determine dominant class in component
             labels_in_feat = dom_label[feat_mask]
@@ -142,17 +148,18 @@ def compute_candidate_risks(
                 )
 
     # 2. Secondary candidates: coarse cells with mixed label histograms
-    # Second most frequent label has at least 30% of cell points
-    coarse_hist = coarse.label_hist  # (400, 400, n_classes)
-    cand_cells_mask = occupied & outside_fine & (~target_mask)
+    # Only evaluate cells that contain points in classes {4, 5, 6} and count >= 2
+    has_relevant = (coarse.label_hist[:, :, 4] > 0) | (coarse.label_hist[:, :, 5] > 0) | (coarse.label_hist[:, :, 6] > 0)
+    cand_cells_mask = occupied & outside_fine & (~target_mask) & (coarse.count >= 2) & has_relevant
 
     if np.any(cand_cells_mask):
         rows, cols = np.where(cand_cells_mask)
+        coarse_hist = coarse.label_hist  # (400, 400, n_classes)
+        full_x = np.broadcast_to(grid_x, (400, 400))
+        full_y = np.broadcast_to(grid_y, (400, 400))
         for r_idx, c_idx in zip(rows, cols):
             h = coarse_hist[r_idx, c_idx]
             total_pts = coarse.count[r_idx, c_idx]
-            if total_pts < 2:
-                continue
 
             sorted_h = np.sort(h)
             second_count = sorted_h[-2]
@@ -168,8 +175,8 @@ def compute_candidate_risks(
                     best_cls = max(relevant_cls, key=lambda l: CLASS_WEIGHTS[l])
                     w_class = CLASS_WEIGHTS[best_cls] * p.mixed_cell_weight_factor
 
-                    cx = float(grid_x[r_idx, c_idx])
-                    cy = float(grid_y[r_idx, c_idx])
+                    cx = float(full_x[r_idx, c_idx])
+                    cy = float(full_y[r_idx, c_idx])
 
                     dy = max(0.0, abs(cy) - p.corridor_half_width)
                     f_y = float(np.exp(-(dy ** 2) / (2.0 * (4.0 ** 2))))

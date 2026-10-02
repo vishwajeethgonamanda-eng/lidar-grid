@@ -511,6 +511,7 @@ def main():
         xyz, labels = generate_patch_eval_scene(seed=42 + st.session_state.frame_idx)
 
     # Process Frame through Pipeline with dynamic grid and optional risk patches
+    t_e2e_start = time.perf_counter()
     base_grid = VarResGrid(n_classes=8, fine_radius=fine_radius, forward_offset=0.0)
     result = process_frame(
         xyz,
@@ -530,33 +531,39 @@ def main():
     extra_mem_kb = result.get("extra_memory_bytes", 0) / 1024.0
     n_patches = len(grid.patches) if hasattr(grid, "patches") else 0
 
-    total_time_ms = max(timings["total_ms"], 0.001)
-    fps = 1000.0 / total_time_ms
+    mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
+    map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
+    raw_img = render_raw_points(xyz, labels, canvas_size=800) if view_layout in ("Raw points", "Side by side") else None
+    t_e2e_end = time.perf_counter()
+
+    pipe_time_ms = max(timings["total_ms"], 0.001)
+    pipe_fps = 1000.0 / pipe_time_ms
+    e2e_time_ms = max((t_e2e_end - t_e2e_start) * 1000.0, 0.001)
+    e2e_fps = 1000.0 / e2e_time_ms
+
     dropped_points = stats["total_input"] - (
         stats["in_fine"] + stats.get("in_patch", 0) + stats["in_coarse"] + stats["out_of_range"]
     )
     compression_ratio = mem_uni / mem_var
 
     # Live Counters & Telemetry Bar
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Pipeline FPS", f"{fps:.1f}", f"{total_time_ms:.1f} ms")
-    c2.metric("Fine Radius", f"{fine_radius:.1f} m", f"Cell: {fine_cell_size * 100:.1f} cm")
-    c3.metric("Stopping Dist", f"{d_stop:.1f} m", f"{speed_mps * 3.6:.1f} km/h")
-    c4.metric(
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("Pipeline FPS", f"{pipe_fps:.1f}", f"{pipe_time_ms:.1f} ms")
+    c2.metric("End-to-End FPS", f"{e2e_fps:.1f}", f"{e2e_time_ms:.1f} ms (w/ draw)")
+    c3.metric("Fine Radius", f"{fine_radius:.1f} m", f"Cell: {fine_cell_size * 100:.1f} cm")
+    c4.metric("Stopping Dist", f"{d_stop:.1f} m", f"{speed_mps * 3.6:.1f} km/h")
+    c5.metric(
         "VarRes Memory",
         f"{mem_var / (1024*1024):.2f} MB",
         f"+{extra_mem_kb:.0f} KB ({n_patches} Patches)" if (patches_enabled and n_patches > 0) else "Constant",
     )
-    c5.metric("Compression", f"{compression_ratio:.1f}x", f"vs {mem_uni / (1024*1024):.0f} MB")
-    c6.metric("Dropped Points", f"{dropped_points}", delta="100% Conserved")
+    c6.metric("Compression", f"{compression_ratio:.1f}x", f"vs {mem_uni / (1024*1024):.0f} MB")
+    c7.metric("Dropped Points", f"{dropped_points}", delta="100% Conserved")
 
     # Main Visual Layout
     col_map, col_info = st.columns([3, 1])
 
     with col_map:
-        mode_key = "state" if view_mode == "Drivable State Map" else "semantic"
-        map_img = render_composite_top_down(grid, trav, view_mode=mode_key, canvas_size=800)
-        raw_img = render_raw_points(xyz, labels, canvas_size=800) if view_layout in ("Raw points", "Side by side") else None
 
         if view_layout == "Grid map":
             st.subheader("2.5D Top-Down Composite Grid (Forward is Up)")

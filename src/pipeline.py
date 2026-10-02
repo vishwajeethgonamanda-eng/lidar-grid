@@ -84,7 +84,12 @@ def process_frame(
     forward_offset = grid.forward_offset if grid is not None else 0.0
     n_classes = grid.n_classes if grid is not None else 8
 
-    init_grid = VarResGrid(n_classes=n_classes, fine_radius=fine_radius, forward_offset=forward_offset)
+    if grid is not None and not getattr(grid, "patches", None):
+        init_grid = grid
+        init_grid.reset()
+    else:
+        init_grid = VarResGrid(n_classes=n_classes, fine_radius=fine_radius, forward_offset=forward_offset)
+
     t_pass1_0 = time.perf_counter()
     init_grid.add_points(xyz, labels)
     t_pass1_1 = time.perf_counter()
@@ -98,22 +103,81 @@ def process_frame(
     risk_time_ms = (t_risk_1 - t_risk_0) * 1000.0
 
     # 3. Pass 2: Re-bin points with focus patches
-    patched_grid = VarResGrid(
-        n_classes=n_classes,
-        fine_radius=fine_radius,
-        forward_offset=forward_offset,
-        patches=patch_centers,
-    )
-    t_add_0 = time.perf_counter()
-    patched_grid.add_points(xyz, labels)
-    t_add_1 = time.perf_counter()
-    add_points_ms = (t_add_1 - t_add_0) * 1000.0
+    if not patch_centers:
+        patched_grid = init_grid
+        add_points_ms = pass1_ms
+        t_trav_0 = time.perf_counter()
+        trav = compute_traversability(patched_grid, params=params)
+        t_trav_1 = time.perf_counter()
+        compute_traversability_ms = (t_trav_1 - t_trav_0) * 1000.0
+    else:
+        patched_grid = VarResGrid(
+            n_classes=n_classes,
+            fine_radius=fine_radius,
+            forward_offset=forward_offset,
+            patches=patch_centers,
+        )
+        t_add_0 = time.perf_counter()
+        if not patched_grid.patches:
+            patched_grid = init_grid
+            t_add_1 = time.perf_counter()
+            add_points_ms = (t_add_1 - t_add_0) * 1000.0
+            t_trav_0 = time.perf_counter()
+            trav = compute_traversability(patched_grid, params=params)
+            t_trav_1 = time.perf_counter()
+            compute_traversability_ms = (t_trav_1 - t_trav_0) * 1000.0
+        else:
+            # Fast selective re-binning: fine zone is invariant and preserved from Pass 1
+            patched_grid.fine = init_grid.fine
 
-    # 4. Traversability analysis across fine, coarse, and patch zones
-    t_trav_0 = time.perf_counter()
-    trav = compute_traversability(patched_grid, params=params)
-    t_trav_1 = time.perf_counter()
-    compute_traversability_ms = (t_trav_1 - t_trav_0) * 1000.0
+            x = xyz[:, 0]
+            y = xyz[:, 1]
+            r_sensor = np.hypot(x, y)
+            r_fine = np.hypot(x - forward_offset, y)
+            mask_out = r_sensor >= 100.0
+            mask_fine = (r_fine < fine_radius) & (~mask_out)
+            mask_coarse_cand = (~mask_fine) & (~mask_out)
+
+            xyz_sub = xyz[mask_coarse_cand]
+            lbls_sub = labels[mask_coarse_cand]
+            x_sub = xyz_sub[:, 0]
+            y_sub = xyz_sub[:, 1]
+
+            mask_rem = np.ones(len(xyz_sub), dtype=bool)
+            n_in_patch = 0
+            for p in patched_grid.patches:
+                mask_p = (
+                    mask_rem
+                    & (x_sub >= p.center_x - p.half_extent)
+                    & (x_sub < p.center_x + p.half_extent)
+                    & (y_sub >= p.center_y - p.half_extent)
+                    & (y_sub < p.center_y + p.half_extent)
+                )
+                cnt_p = int(np.count_nonzero(mask_p))
+                if cnt_p > 0:
+                    p.add_points(xyz_sub[mask_p], lbls_sub[mask_p])
+                    n_in_patch += cnt_p
+                    mask_rem = mask_rem & (~mask_p)
+
+            n_coarse = int(np.count_nonzero(mask_rem))
+            if n_coarse > 0:
+                patched_grid.coarse.add_points(xyz_sub[mask_rem], lbls_sub[mask_rem])
+
+            patched_grid._stats = {
+                "total_input": len(xyz),
+                "in_fine": init_grid._stats["in_fine"],
+                "in_patch": n_in_patch,
+                "in_coarse": n_coarse,
+                "out_of_range": init_grid._stats["out_of_range"],
+            }
+            t_add_1 = time.perf_counter()
+            add_points_ms = (t_add_1 - t_add_0) * 1000.0
+
+            # 4. Traversability analysis across fine, coarse, and patch zones
+            t_trav_0 = time.perf_counter()
+            trav = compute_traversability(patched_grid, params=params)
+            t_trav_1 = time.perf_counter()
+            compute_traversability_ms = (t_trav_1 - t_trav_0) * 1000.0
 
     extra_time_ms = pass1_ms + risk_time_ms
     total_ms = pass1_ms + risk_time_ms + add_points_ms + compute_traversability_ms
@@ -127,6 +191,7 @@ def process_frame(
             "add_points_ms": float(add_points_ms),
             "compute_traversability_ms": float(compute_traversability_ms),
             "risk_time_ms": float(risk_time_ms),
+            "pass1_ms": float(pass1_ms),
             "extra_time_ms": float(extra_time_ms),
             "total_ms": float(total_ms),
         },
