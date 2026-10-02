@@ -116,7 +116,13 @@ class VarResGrid:
     - Out of range: r_sensor >= 100 m
     """
 
-    def __init__(self, n_classes: int, fine_radius: float = 10.0, forward_offset: float = 0.0):
+    def __init__(
+        self,
+        n_classes: int,
+        fine_radius: float = 10.0,
+        forward_offset: float = 0.0,
+        patches: Optional[List[Any]] = None,
+    ):
         self.n_classes = int(n_classes)
         self.fine_radius = float(fine_radius)
         self.forward_offset = float(forward_offset)
@@ -138,8 +144,44 @@ class VarResGrid:
             center_x=0.0,
             center_y=0.0,
         )
+
+        # Build non-overlapping 64 x 64 focus patches (3.2m square at 5cm)
+        self.patches: List[GridZone] = []
+        if patches:
+            for p in patches:
+                if hasattr(p, "x") and hasattr(p, "y"):
+                    cx, cy = float(p.x), float(p.y)
+                elif isinstance(p, (tuple, list)):
+                    cx, cy = float(p[0]), float(p[1])
+                else:
+                    continue
+
+                # Snap center to 5 cm lattice
+                cx_snap = round(cx / 0.05) * 0.05
+                cy_snap = round(cy / 0.05) * 0.05
+
+                # Enforce non-overlapping patches (drop lower-priority / later patch)
+                # Patch half-extent is 1.6 m, so two patches overlap if |dx| < 3.2 and |dy| < 3.2
+                overlaps = False
+                for existing in self.patches:
+                    if abs(cx_snap - existing.center_x) < 3.2 and abs(cy_snap - existing.center_y) < 3.2:
+                        overlaps = True
+                        break
+
+                if not overlaps:
+                    patch_zone = GridZone(
+                        half_extent=1.6,
+                        cell_size=0.05,
+                        grid_size=64,
+                        n_classes=self.n_classes,
+                        center_x=cx_snap,
+                        center_y=cy_snap,
+                    )
+                    self.patches.append(patch_zone)
+
         self._stats = {
             "in_fine": 0,
+            "in_patch": 0,
             "in_coarse": 0,
             "out_of_range": 0,
             "total_input": 0,
@@ -148,8 +190,11 @@ class VarResGrid:
     def reset(self) -> None:
         self.fine.reset()
         self.coarse.reset()
+        for p in self.patches:
+            p.reset()
         self._stats = {
             "in_fine": 0,
+            "in_patch": 0,
             "in_coarse": 0,
             "out_of_range": 0,
             "total_input": 0,
@@ -175,30 +220,48 @@ class VarResGrid:
         r_sensor = np.hypot(x, y)
         r_fine = np.hypot(x - self.forward_offset, y)
 
-        mask_fine = (r_fine < self.fine_radius) & (r_sensor < 100.0)
-        mask_coarse = (~mask_fine) & (r_sensor < 100.0)
         mask_out = r_sensor >= 100.0
+        mask_fine = (r_fine < self.fine_radius) & (~mask_out)
+        mask_remaining = (~mask_fine) & (~mask_out)
 
         n_fine = int(np.count_nonzero(mask_fine))
-        n_coarse = int(np.count_nonzero(mask_coarse))
         n_out = int(np.count_nonzero(mask_out))
-
-        self._stats["total_input"] += n_pts
-        self._stats["in_fine"] += n_fine
-        self._stats["in_coarse"] += n_coarse
-        self._stats["out_of_range"] += n_out
 
         if n_fine > 0:
             self.fine.add_points(xyz[mask_fine], labels[mask_fine])
 
+        n_in_patch = 0
+        if self.patches:
+            for p in self.patches:
+                mask_p = (
+                    mask_remaining
+                    & (x >= p.center_x - p.half_extent)
+                    & (x < p.center_x + p.half_extent)
+                    & (y >= p.center_y - p.half_extent)
+                    & (y < p.center_y + p.half_extent)
+                )
+                cnt_p = int(np.count_nonzero(mask_p))
+                if cnt_p > 0:
+                    p.add_points(xyz[mask_p], labels[mask_p])
+                    n_in_patch += cnt_p
+                    mask_remaining = mask_remaining & (~mask_p)
+
+        n_coarse = int(np.count_nonzero(mask_remaining))
         if n_coarse > 0:
-            self.coarse.add_points(xyz[mask_coarse], labels[mask_coarse])
+            self.coarse.add_points(xyz[mask_remaining], labels[mask_remaining])
+
+        self._stats["total_input"] += n_pts
+        self._stats["in_fine"] += n_fine
+        self._stats["in_patch"] += n_in_patch
+        self._stats["in_coarse"] += n_coarse
+        self._stats["out_of_range"] += n_out
 
     def stats(self) -> Dict[str, int]:
         return dict(self._stats)
 
     def memory_bytes(self) -> int:
-        return self.fine.nbytes + self.coarse.nbytes
+        patch_bytes = sum(p.nbytes for p in self.patches)
+        return self.fine.nbytes + self.coarse.nbytes + patch_bytes
 
     def uniform_equivalent_bytes(self) -> int:
         """Memory if same stats were stored in a uniform 5 cm grid over the 100 m radius."""
