@@ -90,6 +90,12 @@ except ImportError:
 _FONT_RING = ImageFont.load_default(size=14)
 _FONT_LABEL = ImageFont.load_default(size=13)
 
+# Precomputed 3D Car Mesh
+_CAR_MESH_DATA = build_car_mesh()
+_CAR_MESH_VERTICES = np.ascontiguousarray(_CAR_MESH_DATA["vertices"], dtype=np.float32)
+_CAR_MESH_FACES = _CAR_MESH_DATA["faces"]
+_CAR_MESH_COLORS = [hex_to_rgb(c) for c in _CAR_MESH_DATA["colors"]]
+
 # Precomputed 800x800 range mask: distance >= 100m outside circular bounds
 _CANVAS_SIZE = 800
 _GRID_Y, _GRID_X = np.ogrid[:_CANVAS_SIZE, :_CANVAS_SIZE]
@@ -619,7 +625,14 @@ def render_25d_fast(
     # Vectorized / looped span painting
     m_pts = len(u)
     if _HAS_NUMBA:
-        _paint_columns_numba(img, y0_arr, y1_arr, x0_arr, x1_arr, colors)
+        _paint_columns_numba(
+            img,
+            np.ascontiguousarray(y0_arr, dtype=np.int32),
+            np.ascontiguousarray(y1_arr, dtype=np.int32),
+            np.ascontiguousarray(x0_arr, dtype=np.int32),
+            np.ascontiguousarray(x1_arr, dtype=np.int32),
+            np.ascontiguousarray(colors, dtype=np.uint8),
+        )
     else:
         for i in range(m_pts):
             img[y0_arr[i]:y1_arr[i] + 1, x0_arr[i]:x1_arr[i]] = colors[i]
@@ -671,11 +684,10 @@ def render_25d_fast(
                     pil_img.paste(comp_sub, (u_min, v_min))
                     draw = ImageDraw.Draw(pil_img)
 
-    # 5. Project and Draw 3D Ego Crossover Model at Origin using build_car_mesh()
-    car_mesh_data = build_car_mesh()
-    v_car = car_mesh_data["vertices"]  # (V, 3)
-    f_car = car_mesh_data["faces"]     # (F, 3)
-    c_car = [hex_to_rgb(c) for c in car_mesh_data["colors"]]
+    # 5. Project and Draw 3D Ego Crossover Model at Origin using precached car mesh
+    v_car = _CAR_MESH_VERTICES
+    f_car = _CAR_MESH_FACES
+    c_car = _CAR_MESH_COLORS
 
     # Project vertices
     v_rel = v_car - np.array([xc, yc, zc], dtype=np.float32)

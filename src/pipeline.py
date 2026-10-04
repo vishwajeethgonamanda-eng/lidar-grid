@@ -12,6 +12,8 @@ except ImportError:
 from src.traversability import compute_traversability, TraversabilityParams, TraversabilityMap
 from src.risk import compute_candidate_risks, CandidateObject
 
+_CACHED_INIT_GRID: Optional[VarResGrid] = None
+
 
 def process_frame(
     xyz: np.ndarray,
@@ -90,11 +92,21 @@ def process_frame(
     forward_offset = grid.forward_offset if grid is not None else 0.0
     n_classes = grid.n_classes if grid is not None else 8
 
+    global _CACHED_INIT_GRID
     if grid is not None and not getattr(grid, "patches", None):
         init_grid = grid
         init_grid.reset()
+    elif (
+        _CACHED_INIT_GRID is not None
+        and _CACHED_INIT_GRID.fine_radius == fine_radius
+        and _CACHED_INIT_GRID.forward_offset == forward_offset
+        and _CACHED_INIT_GRID.n_classes == n_classes
+    ):
+        init_grid = _CACHED_INIT_GRID
+        init_grid.reset()
     else:
         init_grid = VarResGrid(n_classes=n_classes, fine_radius=fine_radius, forward_offset=forward_offset)
+        _CACHED_INIT_GRID = init_grid
 
     t_pass1_0 = time.perf_counter()
     init_grid.add_points(xyz, labels)

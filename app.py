@@ -10,7 +10,13 @@ from src.grid_engine import (
     stopping_distance,
     adaptive_fine_radius,
 )
-from src.loader import load_scan, load_labels, remap_labels, make_synthetic_scene
+from src.loader import (
+    load_scan,
+    load_labels,
+    remap_labels,
+    make_synthetic_scene,
+    describe_source,
+)
 from src.traversability import (
     TraversabilityParams,
     TraversabilityMap,
@@ -64,9 +70,11 @@ def scan_kitti_sequences(data_dir: Path = Path("data")) -> Dict[str, Dict[str, A
             cand_poses = seq_root / "poses.txt"
             if not cand_poses.exists():
                 cand_poses = seq_root.parent / "poses.txt"
+            desc = describe_source(data_dir=data_dir, seq_id=seq_root.name)
             sequences[seq_name] = {
                 "pairs": pairs,
                 "poses_path": cand_poses if cand_poses.exists() else None,
+                "desc": desc,
             }
 
     return sequences
@@ -284,34 +292,48 @@ def main():
     seq_choice = "00"
 
     if sequences:
-        source_mode = st.sidebar.radio("Select Source", ["SemanticKITTI Dataset", "Synthetic Scene Generator"])
-        if source_mode == "SemanticKITTI Dataset":
+        first_seq_name = list(sequences.keys())[0]
+        first_desc = sequences[first_seq_name]["desc"]
+
+        source_mode = st.sidebar.radio("Select Source", [first_desc.label, "Synthetic scene"])
+        if source_mode == first_desc.label:
             seq_choice = st.sidebar.selectbox("Sequence", list(sequences.keys()))
             frame_pairs = sequences[seq_choice]["pairs"]
             poses_path = sequences[seq_choice]["poses_path"]
+            current_desc = sequences[seq_choice]["desc"]
             num_frames = len(frame_pairs)
             scene_layout_choice = "Open intersection"
         else:
             num_frames = 20
             frame_pairs = None
+            current_desc = describe_source("non_existent_path")
             scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
     else:
-        st.sidebar.info("No SemanticKITTI data found in `data/`. Running in Synthetic Scene mode.")
+        st.sidebar.info("No sequence data found in `data/`. Running in Synthetic scene mode.")
         num_frames = 20
         frame_pairs = None
+        current_desc = describe_source("non_existent_path")
         scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
 
+    st.sidebar.caption(f"**Data Source**: {current_desc.label} ({num_frames} frames)")
+
     # Permanent Data Honesty Badge
-    if frame_pairs is not None:
+    if current_desc.kind == "real_full":
         st.markdown(
             f'<div style="background-color: #163828; color: #2ecc71; padding: 6px 14px; border-radius: 6px; font-weight: 600; margin-bottom: 14px; display: inline-block; border: 1px solid #27ae60;">'
-            f'🟢 SemanticKITTI sequence {seq_choice}, ground-truth labels</div>',
+            f'🟢 {current_desc.label}, sequence {seq_choice}, {num_frames} frames, ground-truth labels</div>',
+            unsafe_allow_html=True,
+        )
+    elif current_desc.kind == "synthetic_kitti_format":
+        st.markdown(
+            f'<div style="background-color: #3e3814; color: #f1c40f; padding: 6px 14px; border-radius: 6px; font-weight: 600; margin-bottom: 14px; display: inline-block; border: 1px solid #f39c12;">'
+            f'🟡 {current_desc.label}, sequence {seq_choice}, {num_frames} frames</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            '<div style="background-color: #3e2714; color: #f39c12; padding: 6px 14px; border-radius: 6px; font-weight: 600; margin-bottom: 14px; display: inline-block; border: 1px solid #d35400;">'
-            '🟠 Synthetic urban scene</div>',
+            f'<div style="background-color: #3e3814; color: #f1c40f; padding: 6px 14px; border-radius: 6px; font-weight: 600; margin-bottom: 14px; display: inline-block; border: 1px solid #f39c12;">'
+            f'🟡 {current_desc.label}, {num_frames} frames</div>',
             unsafe_allow_html=True,
         )
 
@@ -867,6 +889,16 @@ def main():
 | **Display Rate** | {disp_time_ms:.2f} ms ({disp_fps:.1f} FPS) |
 """
         timings_ph.markdown(timings_md)
+
+    # Footer credit for real SemanticKITTI data only
+    if current_desc.kind == "real_full":
+        st.markdown("---")
+        st.markdown(
+            "<div style='text-align: center; color: #8c93a4; font-size: 13px; margin-top: 24px; padding-bottom: 16px;'>"
+            "SemanticKITTI, Behley et al., ICCV 2019, CC BY-NC-SA 4.0"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":

@@ -31,34 +31,23 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_dataset(seq_id: str, n_frames: int) -> Tuple[List[Tuple[np.ndarray, np.ndarray, float]], str]:
-    """Loads frames from data/ if available for sequence, else generates synthetic scenes."""
-    data_dir = Path("data")
-    target_velo = None
+def load_dataset(seq_id: str, n_frames: int):
+    """Loads frames from data/ using describe_source(), or falls back to synthetic scene."""
+    from src.loader import describe_source
 
-    if data_dir.exists():
-        # Look for sequences matching seq_id
-        for velo_dir in data_dir.rglob("velodyne"):
-            seq_root = velo_dir.parent
-            if seq_id in str(seq_root):
-                target_velo = velo_dir
-                break
-        if target_velo is None:
-            # Fall back to any velodyne dir
-            velo_dirs = list(data_dir.rglob("velodyne"))
-            if velo_dirs:
-                target_velo = velo_dirs[0]
-
+    desc = describe_source("data", seq_id=seq_id)
     frames = []
-    if target_velo is not None:
-        seq_root = target_velo.parent
+
+    if desc.kind != "synthetic_scene" and desc.path is not None:
+        seq_root = desc.path
         labels_dir = seq_root / "labels"
+        velo_dir = seq_root / "velodyne"
         cand_poses = seq_root / "poses.txt"
         if not cand_poses.exists():
             cand_poses = seq_root.parent / "poses.txt"
         poses_path = cand_poses if cand_poses.exists() else None
 
-        bin_files = sorted(list(target_velo.glob("*.bin")))
+        bin_files = sorted(list(velo_dir.glob("*.bin")))
         real_pairs = []
         for b in bin_files:
             lbl = labels_dir / f"{b.stem}.label"
@@ -75,20 +64,17 @@ def load_dataset(seq_id: str, n_frames: int) -> Tuple[List[Tuple[np.ndarray, np.
                 speed = get_speed(idx % len(real_pairs), poses_path)
                 frames.append((xyz, labels, speed))
 
-    if frames:
-        mode_str = f"SemanticKITTI sequence {seq_id} ({len(real_pairs)} unique frames, cycled to {len(frames)} frames from {target_velo.parent})"
-    else:
-        mode_str = (
-            f"[NOTICE: Real SemanticKITTI sequence '{seq_id}' not found in data/]\n"
-            f"Using synthetic 64-beam urban street LiDAR generator ({n_frames} frames)."
-        )
-        for idx in range(n_frames):
-            s_val = float(idx * 1.5)
-            xyz, labels = make_urban_scene(frame_idx=idx, seed=42 + idx, layout="street", s=s_val)
-            speed = float(16.0 + 6.0 * np.sin(np.pi * idx / max(1, n_frames - 1)))
-            frames.append((xyz, labels, speed))
+            mode_str = f"{desc.label} (sequence '{desc.name}', {len(real_pairs)} unique frames, cycled to {len(frames)} frames from {desc.path})"
+            return frames, mode_str, desc
 
-    return frames, mode_str
+    mode_str = f"{desc.label} ({n_frames} frames from built-in 64-beam urban generator)"
+    for idx in range(n_frames):
+        s_val = float(idx * 1.5)
+        xyz, labels = make_urban_scene(frame_idx=idx, seed=42 + idx, layout="street", s=s_val)
+        speed = float(16.0 + 6.0 * np.sin(np.pi * idx / max(1, n_frames - 1)))
+        frames.append((xyz, labels, speed))
+
+    return frames, mode_str, desc
 
 
 def main():
@@ -101,7 +87,7 @@ def main():
     print("RAIL-2.5D STANDALONE PIPELINE RUNNER")
     print("=" * 80)
 
-    frames, mode_info = load_dataset(args.seq, args.frames)
+    frames, mode_info, desc = load_dataset(args.seq, args.frames)
     print(f"Data source: {mode_info}")
     print(f"Output directory: {out_dir.resolve()}")
     print(f"Frames to process: {len(frames)}\n")
@@ -178,6 +164,9 @@ def main():
     print(f"  * 95th Percentile Rate:    {p95_fps:.1f} FPS")
     print(f"  * Metrics saved to:        {metrics_csv.resolve()}")
     print("=" * 80)
+
+    if desc.kind == "real_full":
+        print("\nCredit: SemanticKITTI, Behley et al., ICCV 2019, CC BY-NC-SA 4.0\n")
 
 
 if __name__ == "__main__":

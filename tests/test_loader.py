@@ -139,3 +139,102 @@ def test_make_synthetic_scene_and_grid_integration():
     assert stats["in_coarse"] > 0
     assert stats["out_of_range"] > 0
     assert stats["in_fine"] + stats["in_coarse"] + stats["out_of_range"] == stats["total_input"]
+
+
+def test_describe_source_real_dataset(tmp_path):
+    from src.loader import describe_source
+
+    seq_dir = tmp_path / "sequences" / "00"
+    velo_dir = seq_dir / "velodyne"
+    labels_dir = seq_dir / "labels"
+    velo_dir.mkdir(parents=True)
+    labels_dir.mkdir(parents=True)
+
+    # Create dummy bin and label files
+    np.zeros((10, 4), dtype=np.float32).tofile(velo_dir / "000000.bin")
+    np.zeros(10, dtype=np.uint32).tofile(labels_dir / "000000.label")
+
+    desc = describe_source(tmp_path)
+    assert desc.kind == "real_full"
+    assert desc.label == "Real SemanticKITTI"
+    assert desc.name == "00"
+    assert desc.n_frames == 1
+    assert desc.path == seq_dir
+
+    # Test unpacking
+    k, n, nf = desc
+    assert k == "real_full"
+    assert n == "00"
+    assert nf == 1
+
+    k5, l5, n5, nf5, p5 = desc.as_tuple()
+    assert k5 == "real_full"
+    assert l5 == "Real SemanticKITTI"
+    assert n5 == "00"
+    assert nf5 == 1
+    assert p5 == seq_dir
+
+
+def test_describe_source_synthetic_marker_inside_sequence(tmp_path):
+    from src.loader import describe_source
+
+    seq_dir = tmp_path / "synthetic_kitti_sample" / "sequences" / "99"
+    velo_dir = seq_dir / "velodyne"
+    labels_dir = seq_dir / "labels"
+    velo_dir.mkdir(parents=True)
+    labels_dir.mkdir(parents=True)
+
+    np.zeros((5, 4), dtype=np.float32).tofile(velo_dir / "000000.bin")
+    np.zeros(5, dtype=np.uint32).tofile(labels_dir / "000000.label")
+
+    # Place marker inside sequence folder
+    marker = seq_dir / "README_FAKE.txt"
+    marker.write_text("This dataset is synthetic.\n", encoding="utf-8")
+
+    desc = describe_source(tmp_path)
+    assert desc.kind == "synthetic_kitti_format"
+    assert desc.label == "Synthetic (SemanticKITTI format)"
+    assert desc.name == "99"
+    assert desc.n_frames == 1
+
+
+def test_describe_source_synthetic_marker_in_parent(tmp_path):
+    from src.loader import describe_source
+
+    dataset_root = tmp_path / "dataset"
+    seq_dir = dataset_root / "sequences" / "01"
+    velo_dir = seq_dir / "velodyne"
+    labels_dir = seq_dir / "labels"
+    velo_dir.mkdir(parents=True)
+    labels_dir.mkdir(parents=True)
+
+    np.zeros((5, 4), dtype=np.float32).tofile(velo_dir / "000000.bin")
+    np.zeros(5, dtype=np.uint32).tofile(labels_dir / "000000.label")
+
+    # Place marker in parent folder
+    marker = dataset_root / "README_FAKE.txt"
+    marker.write_text("Synthetic marker in parent\n", encoding="utf-8")
+
+    desc = describe_source(tmp_path)
+    assert desc.kind == "synthetic_kitti_format"
+    assert desc.label == "Synthetic (SemanticKITTI format)"
+    assert desc.name == "01"
+
+
+def test_describe_source_synthetic_scene_fallback(tmp_path):
+    from src.loader import describe_source
+
+    # Empty folder
+    desc = describe_source(tmp_path)
+    assert desc.kind == "synthetic_scene"
+    assert desc.label == "Synthetic scene"
+    assert desc.n_frames == 0
+    assert desc.path is None
+
+    # Non-existent folder
+    desc_missing = describe_source(tmp_path / "does_not_exist")
+    assert desc_missing.kind == "synthetic_scene"
+    assert desc_missing.label == "Synthetic scene"
+    assert desc_missing.n_frames == 0
+    assert desc_missing.path is None
+

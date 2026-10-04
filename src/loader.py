@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 # Merged class definitions (classes 0 to 7):
@@ -205,3 +205,175 @@ def make_synthetic_scene(seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
     ]).astype(np.int64)
 
     return scan, labels
+
+
+class SourceDescription:
+    """Descriptor object representing a discovered point cloud data source."""
+
+    def __init__(
+        self,
+        kind: str,
+        label: str,
+        name: str,
+        n_frames: int,
+        path: Optional[Path] = None,
+    ):
+        self.kind = kind
+        self.label = label
+        self.name = name
+        self.n_frames = n_frames
+        self.path = path
+
+    def __iter__(self):
+        return iter((self.kind, self.name, self.n_frames))
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return (self.kind, self.name, self.n_frames)[item]
+        if hasattr(self, item):
+            return getattr(self, item)
+        raise KeyError(item)
+
+    def as_tuple(self):
+        return (self.kind, self.label, self.name, self.n_frames, self.path)
+
+    def __repr__(self):
+        return f"SourceDescription(kind='{self.kind}', label='{self.label}', name='{self.name}', n_frames={self.n_frames}, path={self.path})"
+
+    def __eq__(self, other):
+        if isinstance(other, SourceDescription):
+            return (self.kind, self.label, self.name, self.n_frames, self.path) == (
+                other.kind,
+                other.label,
+                other.name,
+                other.n_frames,
+                other.path,
+            )
+        if isinstance(other, tuple):
+            if len(other) == 3:
+                return (self.kind, self.name, self.n_frames) == other
+            if len(other) == 5:
+                return (self.kind, self.label, self.name, self.n_frames, self.path) == other
+        return False
+
+
+def describe_source(
+    data_dir: Union[str, Path] = "data",
+    seq_id: Optional[str] = None,
+) -> SourceDescription:
+    """Discovers and identifies the nature of the LiDAR point cloud dataset.
+
+    Searches data_dir recursively (up to 3 levels deeper than data_dir) for
+    sequences/<NN>/velodyne folders containing .bin files. Determines whether
+    the data is genuine SemanticKITTI or synthetic by checking for the presence
+    of a 'README_FAKE.txt' marker file in the sequence directory or any of its parents
+    up to data_dir.
+
+    Args:
+        data_dir: Path to directory to search (default: 'data').
+        seq_id: Optional sequence identifier to select (e.g. '00', '99').
+
+    Returns:
+        SourceDescription with kind, label, name, n_frames, and path.
+        kind is:
+          - "real_full": no README_FAKE.txt in sequence folder or any parent folder up to data_dir
+          - "synthetic_kitti_format": README_FAKE.txt exists in sequence folder or a parent folder
+          - "synthetic_scene": no files found, built-in generator used
+        label is:
+          - "Real SemanticKITTI"
+          - "Synthetic (SemanticKITTI format)"
+          - "Synthetic scene"
+    """
+    base_path = Path(data_dir)
+    if not base_path.exists() or not base_path.is_dir():
+        return SourceDescription(
+            kind="synthetic_scene",
+            label="Synthetic scene",
+            name="Synthetic Urban Scene",
+            n_frames=0,
+            path=None,
+        )
+
+    # Search recursively for velodyne directories
+    candidates = []
+    for p in base_path.rglob("velodyne"):
+        if not p.is_dir():
+            continue
+        try:
+            rel = p.relative_to(base_path)
+        except ValueError:
+            continue
+
+        # Depth restriction: sequences/<NN>/velodyne (3 parts) up to 3 levels nested (<= 5 parts)
+        if len(rel.parts) > 5:
+            continue
+
+        seq_root = p.parent
+        bin_files = sorted(list(p.glob("*.bin")))
+        if not bin_files:
+            continue
+
+        labels_dir = seq_root / "labels"
+        n_frames = 0
+        if labels_dir.exists():
+            for b in bin_files:
+                if (labels_dir / f"{b.stem}.label").exists():
+                    n_frames += 1
+        if n_frames == 0:
+            n_frames = len(bin_files)
+
+        if n_frames > 0:
+            candidates.append((seq_root, p, n_frames))
+
+    if not candidates:
+        return SourceDescription(
+            kind="synthetic_scene",
+            label="Synthetic scene",
+            name="Synthetic Urban Scene",
+            n_frames=0,
+            path=None,
+        )
+
+    # Sort candidates for deterministic ordering
+    candidates.sort(key=lambda c: str(c[0]))
+
+    selected = None
+    if seq_id is not None:
+        for seq_root, velo_p, n_frames in candidates:
+            if seq_root.name == seq_id or seq_id in str(seq_root.relative_to(base_path)):
+                selected = (seq_root, velo_p, n_frames)
+                break
+
+    if selected is None:
+        selected = candidates[0]
+
+    seq_root, velo_p, n_frames = selected
+
+    # Check for README_FAKE.txt in seq_root or any parent folder up to base_path (inclusive)
+    has_fake_marker = False
+    curr = seq_root.resolve()
+    base_resolved = base_path.resolve()
+
+    while True:
+        if (curr / "README_FAKE.txt").exists() or (curr / "readme_fake.txt").exists():
+            has_fake_marker = True
+            break
+        if curr == base_resolved or curr.parent == curr:
+            break
+        curr = curr.parent
+
+    if has_fake_marker:
+        kind = "synthetic_kitti_format"
+        label = "Synthetic (SemanticKITTI format)"
+    else:
+        kind = "real_full"
+        label = "Real SemanticKITTI"
+
+    return SourceDescription(
+        kind=kind,
+        label=label,
+        name=seq_root.name,
+        n_frames=n_frames,
+        path=seq_root,
+    )
+
