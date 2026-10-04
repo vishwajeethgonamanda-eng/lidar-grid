@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 
 # Traversability state constants:
@@ -7,6 +7,107 @@ UNKNOWN = np.int8(0)       # empty cell (count == 0)
 DRIVABLE = np.int8(1)      # safe ground/road
 NON_DRIVABLE = np.int8(2)  # geometrically unsafe or prohibited ground
 OBSTACLE = np.int8(3)      # obstacles / objects
+
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+if _HAS_NUMBA:
+    @njit(fastmath=True, cache=True)
+    def _traversability_kernel(
+        count, z_min, z_max, z_sum, z_sq_sum, label_hist,
+        cell_size, max_step, max_slope_deg, terrain_is_drivable, min_points, var_scale,
+        state_out, conf_out,
+    ):
+        rows, cols = count.shape
+        thresh_dz = np.float32(cell_size * np.tan(np.deg2rad(max_slope_deg)))
+
+        z_m = np.zeros((rows, cols), dtype=np.float32)
+        dom_label = np.zeros((rows, cols), dtype=np.int32)
+
+        for r in range(rows):
+            for c in range(cols):
+                cnt = count[r, c]
+                if cnt > 0:
+                    inv_c = 1.0 / cnt
+                    m = z_sum[r, c] * inv_c
+                    z_m[r, c] = np.float32(m)
+                    msq = z_sq_sum[r, c] * inv_c
+                    v = np.float32(max(0.0, msq - m * m))
+                    p_var = np.float32(1.0) / (np.float32(1.0) + v / np.float32(var_scale))
+                    c_occ = np.float32(cnt)
+                    c_ratio = min(np.float32(1.0), c_occ / np.float32(min_points))
+                    conf_out[r, c] = c_ratio * p_var
+
+                    best_lbl = 0
+                    max_lbl_cnt = -1
+                    for l in range(label_hist.shape[2]):
+                        lh = label_hist[r, c, l]
+                        if lh > max_lbl_cnt:
+                            max_lbl_cnt = lh
+                            best_lbl = l
+                    dom_label[r, c] = best_lbl
+
+        # Slope check: 4-neighbours
+        too_steep = np.zeros((rows, cols), dtype=np.bool_)
+        for r in range(rows):
+            for c in range(cols):
+                if count[r, c] > 0:
+                    if r + 1 < rows and count[r + 1, c] > 0:
+                        if abs(z_m[r + 1, c] - z_m[r, c]) > thresh_dz:
+                            too_steep[r, c] = True
+                            too_steep[r + 1, c] = True
+                    if c + 1 < cols and count[r, c + 1] > 0:
+                        if abs(z_m[r, c + 1] - z_m[r, c]) > thresh_dz:
+                            too_steep[r, c] = True
+                            too_steep[r, c + 1] = True
+
+        for r in range(rows):
+            for c in range(cols):
+                cnt = count[r, c]
+                if cnt == 0:
+                    continue
+
+                dl = dom_label[r, c]
+                if dl == 3 or dl == 4 or dl == 5 or dl == 6:
+                    state_out[r, c] = OBSTACLE
+                    continue
+
+                step_height = z_max[r, c] - z_min[r, c]
+                too_high_step = step_height > max_step
+                is_steep = too_steep[r, c]
+
+                if terrain_is_drivable:
+                    prohibited = (dl == 7)
+                else:
+                    prohibited = (dl == 7 or dl == 2)
+
+                if too_high_step or is_steep or prohibited:
+                    state_out[r, c] = NON_DRIVABLE
+                    continue
+
+                if terrain_is_drivable:
+                    drivable = (dl == 1 or dl == 2)
+                else:
+                    drivable = (dl == 1)
+
+                if drivable:
+                    state_out[r, c] = DRIVABLE
+                else:
+                    state_out[r, c] = NON_DRIVABLE
+
+    # Warmup
+    _w_c = np.zeros((1, 1), dtype=np.int32)
+    _w_f32 = np.zeros((1, 1), dtype=np.float32)
+    _w_f64 = np.zeros((1, 1), dtype=np.float64)
+    _w_h = np.zeros((1, 1, 1), dtype=np.int32)
+    _w_s = np.zeros((1, 1), dtype=np.int8)
+    _traversability_kernel(
+        _w_c, _w_f32, _w_f32, _w_f64, _w_f64, _w_h,
+        0.05, 0.1, 15.0, False, 3, 0.05, _w_s, _w_f32
+    )
 
 
 @dataclass
@@ -94,6 +195,25 @@ def _compute_zone_traversability(
     confidence = np.zeros(shape, dtype=np.float32)
 
     if not np.any(occupied):
+        return TraversabilityResult(state, confidence)
+
+    if _HAS_NUMBA:
+        _traversability_kernel(
+            zone.count,
+            zone.z_min,
+            zone.z_max,
+            zone.z_sum,
+            zone.z_sq_sum,
+            zone.label_hist,
+            np.float32(zone.cell_size),
+            np.float32(params.max_step),
+            np.float32(params.max_slope_deg),
+            bool(params.terrain_is_drivable),
+            int(min_points),
+            np.float32(params.var_scale),
+            state,
+            confidence,
+        )
         return TraversabilityResult(state, confidence)
 
     # 1. Compute Confidence

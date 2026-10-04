@@ -438,6 +438,14 @@ def main():
         terrain_is_drivable=bool(terrain_drivable),
     )
 
+    # Benchmark Mode Controls
+    st.sidebar.header("Benchmark")
+    bench_clicked = st.sidebar.button(
+        "Run Benchmark Mode (100 frames)",
+        help="Runs 100 headless pipeline frames to measure pure compute FPS without UI overhead",
+    )
+    bench_result_ph = st.sidebar.empty()
+
     # Static Placeholders created ONCE outside the loop
     telemetry_ph = st.empty()
     col_map, col_info = st.columns([3, 1])
@@ -542,6 +550,27 @@ def main():
         t_p1 = time.perf_counter()
         pipe_ms = max((t_p1 - t_p0) * 1000.0, 0.001)
         return xyz, labels, result, pipe_ms
+
+    if bench_clicked:
+        with bench_result_ph.container():
+            with st.spinner("Benchmarking 100 headless frames..."):
+                t_bench_times = []
+                for b_idx in range(100):
+                    s_bench = float(b_idx * 1.5)
+                    f_idx_bench = b_idx % max(1, num_frames)
+                    _, _, _, p_ms = run_pipeline_for_frame(f_idx_bench, s_bench)
+                    t_bench_times.append(p_ms)
+                b_mean_ms = float(np.mean(t_bench_times))
+                b_p95_ms = float(np.percentile(t_bench_times, 95))
+                b_mean_fps = 1000.0 / max(0.001, b_mean_ms)
+                b_p95_fps = 1000.0 / max(0.001, b_p95_ms)
+                pass_status = b_mean_fps >= 30.0 and b_p95_fps >= 25.0
+                st.success(
+                    f"**Benchmark Mode (100 Frames):**\n\n"
+                    f"- **Mean Pipeline Rate**: {b_mean_fps:.1f} FPS ({b_mean_ms:.2f} ms)\n"
+                    f"- **95th Percentile**: {b_p95_fps:.1f} FPS ({b_p95_ms:.2f} ms)\n"
+                    f"- **Target (≥30 FPS)**: {'PASS' if pass_status else 'FAIL'}"
+                )
 
     # Mode 1: Active Playback using while loop with fast rasters (NO st.rerun, NO fragment)
     if st.session_state.playing:

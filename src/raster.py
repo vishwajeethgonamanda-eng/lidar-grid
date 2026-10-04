@@ -80,11 +80,62 @@ SEMANTIC_HEX_COLORS = {
     7: "#f1c40f",
 }
 
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+# Preloaded fonts
+_FONT_RING = ImageFont.load_default(size=14)
+_FONT_LABEL = ImageFont.load_default(size=13)
+
 # Precomputed 800x800 range mask: distance >= 100m outside circular bounds
 _CANVAS_SIZE = 800
 _GRID_Y, _GRID_X = np.ogrid[:_CANVAS_SIZE, :_CANVAS_SIZE]
 _DIST_FROM_CENTER = np.hypot(_GRID_X - 400.0, _GRID_Y - 400.0)
 _MASK_OUTSIDE_100M = _DIST_FROM_CENTER >= 400.0
+
+if _HAS_NUMBA:
+    @njit(fastmath=True, cache=True)
+    def _mask_outside_circle_numba(img, bg_r, bg_g, bg_b):
+        rows, cols, _ = img.shape
+        cr = rows // 2
+        cc = cols // 2
+        r_sq = (rows // 2) ** 2
+        for r in range(rows):
+            dr = r - cr
+            dr2 = dr * dr
+            for c in range(cols):
+                dc = c - cc
+                if dr2 + dc * dc >= r_sq:
+                    img[r, c, 0] = bg_r
+                    img[r, c, 1] = bg_g
+                    img[r, c, 2] = bg_b
+
+    @njit(fastmath=True, cache=True)
+    def _paint_columns_numba(img, y0, y1, x0, x1, colors):
+        n = len(y0)
+        for i in range(n):
+            r0 = y0[i]
+            r1 = y1[i] + 1
+            c0 = x0[i]
+            c1 = x1[i]
+            cr = colors[i, 0]
+            cg = colors[i, 1]
+            cb = colors[i, 2]
+            for r in range(r0, r1):
+                for c in range(c0, c1):
+                    img[r, c, 0] = cr
+                    img[r, c, 1] = cg
+                    img[r, c, 2] = cb
+
+    # Warmup
+    _w_img = np.zeros((2, 2, 3), dtype=np.uint8)
+    _mask_outside_circle_numba(_w_img, 20, 22, 28)
+    _paint_columns_numba(_w_img, np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32),
+                         np.zeros(1, dtype=np.int32), np.zeros(1, dtype=np.int32),
+                         np.zeros((1, 3), dtype=np.uint8))
 
 
 def _draw_topdown_car_icon(draw: ImageDraw.ImageDraw, center: int = 400, scale: float = 4.0) -> None:
@@ -190,13 +241,16 @@ def render_grid_map(
             img[px_r, px_c] = f_col
 
     # 4. Mask circular 100m range
-    img[_MASK_OUTSIDE_100M] = BG_COLOR
+    if _HAS_NUMBA:
+        _mask_outside_circle_numba(img, 20, 22, 28)
+    else:
+        img[_MASK_OUTSIDE_100M] = BG_COLOR
 
     # 5. PIL Vector Overlay: Range Rings, Fine-Zone Ring, Focus Patches, Car Icon, Labels
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
-    font_ring = ImageFont.load_default(size=14)
-    font_label = ImageFont.load_default(size=13)
+    font_ring = _FONT_RING
+    font_label = _FONT_LABEL
 
     # Range Rings at 10, 30, 50, 100 m
     for r in [10, 30, 50, 100]:
@@ -241,24 +295,37 @@ def render_grid_map(
             draw.rectangle([(tag_x, tag_y), (tag_x + 88, tag_y + 17)], fill=(25, 25, 12, 230), outline=(255, 215, 0))
             draw.text((tag_x + 4, tag_y + 1), "focus patch", fill=(255, 215, 0), font=font_label)
 
-    # 6. Sensing rings on ground under car
+    # 6. Sensing rings on ground under car (localized bbox alpha-composite)
     if sensing_mode != "Off":
         rings = compute_sensing_rings(mode=sensing_mode, current_time=current_time)
         if rings:
-            overlay = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-            ov_draw = ImageDraw.Draw(overlay)
-            for r_m, alpha in sorted(rings, key=lambda x: -x[0]):
-                r_px = int(r_m * scale)
-                fill_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(alpha * 255))
-                edge_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(min(1.0, alpha * 2.2) * 255))
-                ov_draw.ellipse(
-                    [(center - r_px, center - r_px), (center + r_px, center + r_px)],
-                    fill=fill_rgba,
-                    outline=edge_rgba,
-                    width=1,
-                )
-            pil_img = Image.alpha_composite(pil_img.convert("RGBA"), overlay).convert("RGB")
-            draw = ImageDraw.Draw(pil_img)
+            max_r_m = max(r_m for r_m, _ in rings)
+            max_r_px = int(max_r_m * scale) + 4
+            u_min = max(0, center - max_r_px)
+            u_max = min(canvas_size, center + max_r_px)
+            v_min = max(0, center - max_r_px)
+            v_max = min(canvas_size, center + max_r_px)
+            box_w = u_max - u_min
+            box_h = v_max - v_min
+            if box_w > 0 and box_h > 0:
+                overlay_sub = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+                ov_draw = ImageDraw.Draw(overlay_sub)
+                sub_center_x = center - u_min
+                sub_center_y = center - v_min
+                for r_m, alpha in sorted(rings, key=lambda x: -x[0]):
+                    r_px = int(r_m * scale)
+                    fill_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(alpha * 255))
+                    edge_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(min(1.0, alpha * 2.2) * 255))
+                    ov_draw.ellipse(
+                        [(sub_center_x - r_px, sub_center_y - r_px), (sub_center_x + r_px, sub_center_y + r_px)],
+                        fill=fill_rgba,
+                        outline=edge_rgba,
+                        width=1,
+                    )
+                sub_crop = pil_img.crop((u_min, v_min, u_max, v_max)).convert("RGBA")
+                comp_sub = Image.alpha_composite(sub_crop, overlay_sub).convert("RGB")
+                pil_img.paste(comp_sub, (u_min, v_min))
+                draw = ImageDraw.Draw(pil_img)
 
     # 7. Top-down Car Icon at origin
     _draw_topdown_car_icon(draw, center=center, scale=scale)
@@ -325,12 +392,15 @@ def render_raw_points(
         img[px_r1, px_c1] = point_colors
 
     # Mask outside 100m circle
-    img[_MASK_OUTSIDE_100M] = BG_COLOR
+    if _HAS_NUMBA:
+        _mask_outside_circle_numba(img, 20, 22, 28)
+    else:
+        img[_MASK_OUTSIDE_100M] = BG_COLOR
 
     # PIL Annotations: Range rings, Sensing Rings & car icon
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
-    font_ring = ImageFont.load_default(size=14)
+    font_ring = _FONT_RING
 
     for r in [10, 30, 50, 100]:
         r_px = int(r * scale)
@@ -340,24 +410,37 @@ def render_raw_points(
         draw.rectangle([(lbl_x - 3, lbl_y - 2), (lbl_x + 36, lbl_y + 16)], fill=(16, 18, 24, 230), outline=(50, 55, 68))
         draw.text((lbl_x + 2, lbl_y - 1), f"{r}m", fill=(200, 208, 222), font=font_ring)
 
-    # Sensing rings on ground under car
+    # Sensing rings on ground under car (localized bbox alpha-composite)
     if sensing_mode != "Off":
         rings = compute_sensing_rings(mode=sensing_mode, current_time=current_time)
         if rings:
-            overlay = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-            ov_draw = ImageDraw.Draw(overlay)
-            for r_m, alpha in sorted(rings, key=lambda x: -x[0]):
-                r_px = int(r_m * scale)
-                fill_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(alpha * 255))
-                edge_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(min(1.0, alpha * 2.2) * 255))
-                ov_draw.ellipse(
-                    [(center - r_px, center - r_px), (center + r_px, center + r_px)],
-                    fill=fill_rgba,
-                    outline=edge_rgba,
-                    width=1,
-                )
-            pil_img = Image.alpha_composite(pil_img.convert("RGBA"), overlay).convert("RGB")
-            draw = ImageDraw.Draw(pil_img)
+            max_r_m = max(r_m for r_m, _ in rings)
+            max_r_px = int(max_r_m * scale) + 4
+            u_min = max(0, center - max_r_px)
+            u_max = min(canvas_size, center + max_r_px)
+            v_min = max(0, center - max_r_px)
+            v_max = min(canvas_size, center + max_r_px)
+            box_w = u_max - u_min
+            box_h = v_max - v_min
+            if box_w > 0 and box_h > 0:
+                overlay_sub = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+                ov_draw = ImageDraw.Draw(overlay_sub)
+                sub_center_x = center - u_min
+                sub_center_y = center - v_min
+                for r_m, alpha in sorted(rings, key=lambda x: -x[0]):
+                    r_px = int(r_m * scale)
+                    fill_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(alpha * 255))
+                    edge_rgba = (RING_TEAL_RGB[0], RING_TEAL_RGB[1], RING_TEAL_RGB[2], int(min(1.0, alpha * 2.2) * 255))
+                    ov_draw.ellipse(
+                        [(sub_center_x - r_px, sub_center_y - r_px), (sub_center_x + r_px, sub_center_y + r_px)],
+                        fill=fill_rgba,
+                        outline=edge_rgba,
+                        width=1,
+                    )
+                sub_crop = pil_img.crop((u_min, v_min, u_max, v_max)).convert("RGBA")
+                comp_sub = Image.alpha_composite(sub_crop, overlay_sub).convert("RGB")
+                pil_img.paste(comp_sub, (u_min, v_min))
+                draw = ImageDraw.Draw(pil_img)
 
     _draw_topdown_car_icon(draw, center=center, scale=scale)
     return np.asarray(pil_img)
@@ -535,8 +618,11 @@ def render_25d_fast(
 
     # Vectorized / looped span painting
     m_pts = len(u)
-    for i in range(m_pts):
-        img[y0_arr[i]:y1_arr[i] + 1, x0_arr[i]:x1_arr[i]] = colors[i]
+    if _HAS_NUMBA:
+        _paint_columns_numba(img, y0_arr, y1_arr, x0_arr, x1_arr, colors)
+    else:
+        for i in range(m_pts):
+            img[y0_arr[i]:y1_arr[i] + 1, x0_arr[i]:x1_arr[i]] = colors[i]
 
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
