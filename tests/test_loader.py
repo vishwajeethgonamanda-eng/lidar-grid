@@ -238,3 +238,123 @@ def test_describe_source_synthetic_scene_fallback(tmp_path):
     assert desc_missing.n_frames == 0
     assert desc_missing.path is None
 
+
+def test_search_order_only_sample_data_present(tmp_path):
+    from src.loader import describe_source
+
+    sample_seq = tmp_path / "sample_data" / "sequences" / "99"
+    velo_dir = sample_seq / "velodyne"
+    labels_dir = sample_seq / "labels"
+    velo_dir.mkdir(parents=True)
+    labels_dir.mkdir(parents=True)
+
+    np.zeros((6, 4), dtype=np.float32).tofile(velo_dir / "000000.bin")
+    np.zeros(6, dtype=np.uint32).tofile(labels_dir / "000000.label")
+    (sample_seq / "README_FAKE.txt").write_text("fake data\n", encoding="utf-8")
+
+    # 1. Calling describe_source with root tmp_path containing only sample_data
+    desc1 = describe_source(tmp_path)
+    assert desc1.kind == "synthetic_kitti_format"
+    assert desc1.label == "Synthetic (SemanticKITTI format)"
+    assert desc1.name == "99"
+    assert desc1.n_frames == 1
+    assert desc1.path == sample_seq
+    assert desc1.origin == "sample_data/ (excerpt)"
+
+    # 2. Calling describe_source with explicit data_dir and sample_dir
+    desc2 = describe_source(data_dir=tmp_path / "data", sample_dir=tmp_path / "sample_data")
+    assert desc2.kind == "synthetic_kitti_format"
+    assert desc2.label == "Synthetic (SemanticKITTI format)"
+    assert desc2.name == "99"
+    assert desc2.n_frames == 1
+    assert desc2.path == sample_seq
+    assert desc2.origin == "sample_data/ (excerpt)"
+
+
+def test_search_order_both_present_data_wins(tmp_path):
+    from src.loader import describe_source
+
+    # Real data in data/
+    data_seq = tmp_path / "data" / "sequences" / "00"
+    velo_data = data_seq / "velodyne"
+    labels_data = data_seq / "labels"
+    velo_data.mkdir(parents=True)
+    labels_data.mkdir(parents=True)
+    np.zeros((10, 4), dtype=np.float32).tofile(velo_data / "000000.bin")
+    np.zeros(10, dtype=np.uint32).tofile(labels_data / "000000.label")
+
+    # Synthetic sample in sample_data/
+    sample_seq = tmp_path / "sample_data" / "sequences" / "99"
+    velo_sample = sample_seq / "velodyne"
+    labels_sample = sample_seq / "labels"
+    velo_sample.mkdir(parents=True)
+    labels_sample.mkdir(parents=True)
+    np.zeros((5, 4), dtype=np.float32).tofile(velo_sample / "000000.bin")
+    np.zeros(5, dtype=np.uint32).tofile(labels_sample / "000000.label")
+    (sample_seq / "README_FAKE.txt").write_text("fake marker\n", encoding="utf-8")
+
+    # 1. Calling describe_source with root tmp_path: data/ must win
+    desc1 = describe_source(tmp_path)
+    assert desc1.kind == "real_full"
+    assert desc1.label == "Real SemanticKITTI"
+    assert desc1.name == "00"
+    assert desc1.n_frames == 1
+    assert desc1.path == data_seq
+    assert desc1.origin == "data/"
+
+    # 2. Calling with explicit data_dir and sample_dir: data/ must win
+    desc2 = describe_source(data_dir=tmp_path / "data", sample_dir=tmp_path / "sample_data")
+    assert desc2.kind == "real_full"
+    assert desc2.label == "Real SemanticKITTI"
+    assert desc2.name == "00"
+    assert desc2.n_frames == 1
+    assert desc2.path == data_seq
+    assert desc2.origin == "data/"
+
+
+def test_search_order_neither_present(tmp_path):
+    from src.loader import describe_source
+
+    # Neither folder has sequence files
+    empty_data = tmp_path / "data"
+    empty_sample = tmp_path / "sample_data"
+    empty_data.mkdir()
+    empty_sample.mkdir()
+
+    # 1. Root tmp_path
+    desc1 = describe_source(tmp_path)
+    assert desc1.kind == "synthetic_scene"
+    assert desc1.label == "Synthetic scene"
+    assert desc1.n_frames == 0
+    assert desc1.path is None
+    assert desc1.origin is None
+
+    # 2. Explicit data_dir and sample_dir
+    desc2 = describe_source(data_dir=empty_data, sample_dir=empty_sample)
+    assert desc2.kind == "synthetic_scene"
+    assert desc2.label == "Synthetic scene"
+    assert desc2.n_frames == 0
+    assert desc2.path is None
+    assert desc2.origin is None
+
+
+def test_search_nested_folder_layout(tmp_path):
+    from src.loader import describe_source
+
+    # data/<folder>/sequences/<NN>
+    nested_seq = tmp_path / "data" / "kitti_dataset" / "sequences" / "03"
+    velo_dir = nested_seq / "velodyne"
+    labels_dir = nested_seq / "labels"
+    velo_dir.mkdir(parents=True)
+    labels_dir.mkdir(parents=True)
+    np.zeros((8, 4), dtype=np.float32).tofile(velo_dir / "000000.bin")
+    np.zeros(8, dtype=np.uint32).tofile(labels_dir / "000000.label")
+
+    desc = describe_source(tmp_path)
+    assert desc.kind == "real_full"
+    assert desc.label == "Real SemanticKITTI"
+    assert desc.name == "03"
+    assert desc.n_frames == 1
+    assert desc.path == nested_seq
+    assert desc.origin == "data/"
+

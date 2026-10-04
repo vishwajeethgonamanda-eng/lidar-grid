@@ -16,6 +16,8 @@ from src.loader import (
     remap_labels,
     make_synthetic_scene,
     describe_source,
+    scan_kitti_sequences,
+    SourceDescription,
 )
 from src.traversability import (
     TraversabilityParams,
@@ -43,41 +45,7 @@ import plotly.graph_objects as go
 render_composite_top_down = render_grid_map
 
 
-def scan_kitti_sequences(data_dir: Path = Path("data")) -> Dict[str, Dict[str, Any]]:
-    """Scans data/ directory for SemanticKITTI sequences containing pairs of .bin and .label files."""
-    sequences = {}
-    if not data_dir.exists():
-        return sequences
 
-    for velo_dir in data_dir.rglob("velodyne"):
-        seq_root = velo_dir.parent
-        labels_dir = seq_root / "labels"
-        if not labels_dir.exists():
-            continue
-
-        bin_files = sorted(list(velo_dir.glob("*.bin")))
-        if not bin_files:
-            continue
-
-        pairs = []
-        for b in bin_files:
-            lbl = labels_dir / f"{b.stem}.label"
-            if lbl.exists():
-                pairs.append((b, lbl))
-
-        if pairs:
-            seq_name = str(seq_root.relative_to(data_dir))
-            cand_poses = seq_root / "poses.txt"
-            if not cand_poses.exists():
-                cand_poses = seq_root.parent / "poses.txt"
-            desc = describe_source(data_dir=data_dir, seq_id=seq_root.name)
-            sequences[seq_name] = {
-                "pairs": pairs,
-                "poses_path": cand_poses if cand_poses.exists() else None,
-                "desc": desc,
-            }
-
-    return sequences
 
 
 # HTML Legend definitions placed above each view (16px squares, 15px bold labels)
@@ -287,7 +255,7 @@ def main():
 
     # Sidebar: Data Source & Settings
     st.sidebar.header("Data Source")
-    sequences = scan_kitti_sequences(Path("data"))
+    sequences = scan_kitti_sequences()
     poses_path = None
     seq_choice = "00"
 
@@ -306,16 +274,36 @@ def main():
         else:
             num_frames = 20
             frame_pairs = None
-            current_desc = describe_source(Path("data"))
+            current_desc = SourceDescription(
+                kind="synthetic_scene",
+                label="Synthetic scene",
+                name="Synthetic Urban Scene",
+                n_frames=0,
+                path=None,
+            )
             scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
     else:
-        st.sidebar.info("No sequence data found in `data/`. Running in Synthetic scene mode.")
+        st.sidebar.info("No sequence data found in `data/` or `sample_data/`. Running in Synthetic scene mode.")
         num_frames = 20
         frame_pairs = None
-        current_desc = describe_source(Path("data"))
+        current_desc = SourceDescription(
+            kind="synthetic_scene",
+            label="Synthetic scene",
+            name="Synthetic Urban Scene",
+            n_frames=0,
+            path=None,
+        )
         scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
 
-    st.sidebar.caption(f"**Data Source**: {current_desc.label} ({num_frames} frames)")
+    # Sidebar: Show sequence, frame count, and origin
+    if current_desc.kind != "synthetic_scene":
+        origin_str = current_desc.origin or ("sample_data/ (excerpt)" if current_desc.path and "sample_data" in str(current_desc.path) else "data/")
+        st.sidebar.caption(
+            f"**Data Source**: {current_desc.label} ({num_frames} frames)  \n"
+            f"**Sequence**: {seq_choice} | **Source**: {origin_str}"
+        )
+    else:
+        st.sidebar.caption(f"**Data Source**: {current_desc.label} ({num_frames} frames)")
 
     # Permanent Data Honesty Badge
     if current_desc.kind == "real_full":

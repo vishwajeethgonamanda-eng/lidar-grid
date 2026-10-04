@@ -91,16 +91,21 @@ Evaluated over 300 frames with 100,000 points per frame (median of 3 runs, 10-fr
 
 ## Limitations
 
-- **Synthetic Data:** The bundled sample data in `data/` is synthetic data generated in SemanticKITTI format.
+- **Synthetic Data:** The bundled excerpt in `sample_data/` is synthetic data generated in SemanticKITTI format (containing a `README_FAKE.txt` marker).
 - **Slope Rejection with 5 cm Cells:** With 5 cm cells, the 15-degree slope rule between immediately adjacent cells rejects about 30 percent of road cells because LiDAR range noise ($\sigma \approx 2\text{ cm}$) exceeds the 1.34 cm height difference threshold over 5 cm. Planned fix: slope evaluated over a 25 cm physical baseline.
 
 ---
 
-## Adding Real SemanticKITTI Data
+## Dataset Discovery & Adding Real SemanticKITTI Data
+
+The loader discovers sequences automatically in the following precedence order:
+1. `data/` (recursively searched up to 3 levels, supporting both `data/sequences/<NN>` and `data/<folder>/sequences/<NN>`).
+2. `sample_data/` (tracked in the repository, containing a 20-frame excerpt of sequence `99`).
+3. Procedural synthetic scene generator (used when neither folder contains matching `.bin` and `.label` sequence files).
 
 To evaluate on real SemanticKITTI scans:
 1. Download a sequence (e.g. sequence `00`) from the official SemanticKITTI dataset.
-2. Place the sequence folder under `data/sequences/00/`:
+2. Place the sequence folder under `data/sequences/00/` (or nested `data/<folder>/sequences/00/`):
    ```text
    data/
    └── sequences/
@@ -113,7 +118,7 @@ To evaluate on real SemanticKITTI scans:
            │   └── ...
            └── poses.txt
    ```
-3. The pipeline will automatically detect the real dataset (verifying the absence of `README_FAKE.txt`), display the green "Real SemanticKITTI" badge, and use genuine vehicle poses for automatic speed estimation.
+3. The pipeline will prioritize `data/` over `sample_data/`, detect the real dataset (verifying the absence of `README_FAKE.txt`), display the green "Real SemanticKITTI" badge with origin `data/`, and use genuine vehicle poses for automatic speed estimation. Only genuine data without a marker file receives the official SemanticKITTI credit.
 
 ---
 

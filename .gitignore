@@ -1,4 +1,5 @@
 data/
+!sample_data/
 data_fake/
 .venv/
 __pycache__/
