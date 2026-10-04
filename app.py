@@ -306,13 +306,13 @@ def main():
         else:
             num_frames = 20
             frame_pairs = None
-            current_desc = describe_source("non_existent_path")
+            current_desc = describe_source(Path("data"))
             scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
     else:
         st.sidebar.info("No sequence data found in `data/`. Running in Synthetic scene mode.")
         num_frames = 20
         frame_pairs = None
-        current_desc = describe_source("non_existent_path")
+        current_desc = describe_source(Path("data"))
         scene_layout_choice = st.sidebar.selectbox("Scene layout", ["Open intersection", "Narrow street"], index=0)
 
     st.sidebar.caption(f"**Data Source**: {current_desc.label} ({num_frames} frames)")

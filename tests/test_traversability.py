@@ -92,15 +92,28 @@ def test_slope_steep_vs_gentle():
     row_a = int(np.floor((2.02 + 10.0) / 0.05))
     assert res_gentle.fine.state[row_a, col_a] == DRIVABLE
 
-    # 2. Steep ramp (e.g. 25 degrees > 15 degrees):
-    # dx = 0.05 m, dz for 25 deg is 0.05 * tan(25 deg) ~ 0.0233 m
+    # 2. Steep ramp exceeding both 15 degrees and min_slope_dz_m (3 cm):
+    # dx = 0.05 m, dz = 0.035 m (3.5 cm >= 3 cm), atan(0.035 / 0.05) ~ 35.0 deg > 15 deg
     grid_steep = VarResGrid(n_classes=8)
     pts_s1 = np.array([[2.02, 2.02, 0.00]] * 10, dtype=np.float32)
-    pts_s2 = np.array([[2.07, 2.02, 0.025]] * 10, dtype=np.float32)  # atan(0.025 / 0.05) ~ 26.5 deg
+    pts_s2 = np.array([[2.07, 2.02, 0.035]] * 10, dtype=np.float32)
     grid_steep.add_points(np.vstack([pts_s1, pts_s2]), np.full(20, 1, dtype=np.int64))
     res_steep = compute_traversability(grid_steep, params)
 
     assert res_steep.fine.state[row_a, col_a] == NON_DRIVABLE
+
+    # 3. Steep slope angle (>15 deg) but dz < 3 cm is NOT rejected under default min_slope_dz_m = 0.03:
+    grid_sub3cm = VarResGrid(n_classes=8)
+    pts_sub1 = np.array([[2.02, 2.02, 0.00]] * 10, dtype=np.float32)
+    pts_sub2 = np.array([[2.07, 2.02, 0.025]] * 10, dtype=np.float32)  # dz = 2.5 cm < 3 cm, angle ~ 26.5 deg > 15 deg
+    grid_sub3cm.add_points(np.vstack([pts_sub1, pts_sub2]), np.full(20, 1, dtype=np.int64))
+    res_sub3cm = compute_traversability(grid_sub3cm, params)
+    assert res_sub3cm.fine.state[row_a, col_a] == DRIVABLE
+
+    # If min_slope_dz_m = 0.02 is configured, that same 2.5 cm ramp is rejected:
+    params_low_dz = TraversabilityParams(max_slope_deg=15.0, slope_baseline_m=0.05, min_slope_dz_m=0.02)
+    res_low_dz = compute_traversability(grid_sub3cm, params_low_dz)
+    assert res_low_dz.fine.state[row_a, col_a] == NON_DRIVABLE
 
 
 def test_person_dominated_cell_is_obstacle():

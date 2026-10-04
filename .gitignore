@@ -1,5 +1,7 @@
+data/
+data_fake/
 .venv/
 __pycache__/
 .pytest_cache/
 *.pyc
-data/
+results/*.csv

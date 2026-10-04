@@ -18,7 +18,7 @@ if _HAS_NUMBA:
     @njit(fastmath=True, cache=True)
     def _traversability_kernel(
         count, z_min, z_max, z_sum, z_sq_sum, label_hist,
-        cell_size, max_step, max_slope_deg, slope_baseline_m, terrain_is_drivable, min_points, var_scale,
+        cell_size, max_step, max_slope_deg, slope_baseline_m, min_slope_dz_m, terrain_is_drivable, min_points, var_scale,
         state_out, conf_out,
     ):
         rows, cols = count.shape
@@ -90,14 +90,22 @@ if _HAS_NUMBA:
                             if c - d >= 0 and count[r, c - d] > 0:
                                 d_neg_x = d
                                 break
+                        dz_x = 0.0
                         if d_pos_x > 0 and d_neg_x > 0:
                             gx = (z_bar[r, c + d_pos_x] - z_bar[r, c - d_neg_x]) / ((d_pos_x + d_neg_x) * cell_size)
+                            dz_x = max(
+                                abs(z_bar[r, c + d_pos_x] - z_bar[r, c - d_neg_x]),
+                                max(abs(z_bar[r, c + d_pos_x] - z_bar[r, c]), abs(z_bar[r, c - d_neg_x] - z_bar[r, c]))
+                            )
                         elif d_pos_x > 0:
                             gx = (z_bar[r, c + d_pos_x] - z_bar[r, c]) / (d_pos_x * cell_size)
+                            dz_x = abs(z_bar[r, c + d_pos_x] - z_bar[r, c])
                         elif d_neg_x > 0:
                             gx = (z_bar[r, c] - z_bar[r, c - d_neg_x]) / (d_neg_x * cell_size)
+                            dz_x = abs(z_bar[r, c] - z_bar[r, c - d_neg_x])
                         else:
                             gx = 0.0
+                            dz_x = 0.0
 
                         d_pos_y = 0
                         for d in range(w, 0, -1):
@@ -109,18 +117,27 @@ if _HAS_NUMBA:
                             if r - d >= 0 and count[r - d, c] > 0:
                                 d_neg_y = d
                                 break
+                        dz_y = 0.0
                         if d_pos_y > 0 and d_neg_y > 0:
                             gy = (z_bar[r + d_pos_y, c] - z_bar[r - d_neg_y, c]) / ((d_pos_y + d_neg_y) * cell_size)
+                            dz_y = max(
+                                abs(z_bar[r + d_pos_y, c] - z_bar[r - d_neg_y, c]),
+                                max(abs(z_bar[r + d_pos_y, c] - z_bar[r, c]), abs(z_bar[r - d_neg_y, c] - z_bar[r, c]))
+                            )
                         elif d_pos_y > 0:
                             gy = (z_bar[r + d_pos_y, c] - z_bar[r, c]) / (d_pos_y * cell_size)
+                            dz_y = abs(z_bar[r + d_pos_y, c] - z_bar[r, c])
                         elif d_neg_y > 0:
                             gy = (z_bar[r, c] - z_bar[r - d_neg_y, c]) / (d_neg_y * cell_size)
+                            dz_y = abs(z_bar[r, c] - z_bar[r - d_neg_y, c])
                         else:
                             gy = 0.0
+                            dz_y = 0.0
 
+                        max_dz = max(dz_x, dz_y)
                         grad_mag = np.sqrt(gx * gx + gy * gy)
                         slope = np.arctan(grad_mag)
-                        if slope > thresh_slope_rad:
+                        if slope > thresh_slope_rad and max_dz >= min_slope_dz_m:
                             too_steep[r, c] = True
         else:
             thresh_dz = np.float32(cell_size * np.tan(np.deg2rad(max_slope_deg)))
@@ -128,11 +145,13 @@ if _HAS_NUMBA:
                 for c in range(cols):
                     if count[r, c] > 0:
                         if r + 1 < rows and count[r + 1, c] > 0:
-                            if abs(z_m[r + 1, c] - z_m[r, c]) > thresh_dz:
+                            dz = abs(z_m[r + 1, c] - z_m[r, c])
+                            if dz > thresh_dz and dz >= min_slope_dz_m:
                                 too_steep[r, c] = True
                                 too_steep[r + 1, c] = True
                         if c + 1 < cols and count[r, c + 1] > 0:
-                            if abs(z_m[r, c + 1] - z_m[r, c]) > thresh_dz:
+                            dz = abs(z_m[r, c + 1] - z_m[r, c])
+                            if dz > thresh_dz and dz >= min_slope_dz_m:
                                 too_steep[r, c] = True
                                 too_steep[r, c + 1] = True
 
@@ -178,7 +197,7 @@ if _HAS_NUMBA:
     _w_s = np.zeros((1, 1), dtype=np.int8)
     _traversability_kernel(
         _w_c, _w_f32, _w_f32, _w_f64, _w_f64, _w_h,
-        0.05, 0.1, 15.0, 0.25, False, 3, 0.05, _w_s, _w_f32
+        0.05, 0.1, 15.0, 0.25, 0.03, False, 3, 0.05, _w_s, _w_f32
     )
 
 
@@ -190,6 +209,7 @@ class TraversabilityParams:
         max_step: Maximum allowed vertical step height (z_max - z_min) in metres.
         max_slope_deg: Maximum allowed slope in degrees relative to occupied neighbours.
         slope_baseline_m: Physical baseline in metres over which slope is evaluated (default: 0.25 m).
+        min_slope_dz_m: Minimum absolute height difference (m) to a neighbour required to trigger steep-slope rejection (default: 0.03 m).
         terrain_is_drivable: If True, terrain (label 2) is considered drivable when flat.
         min_points_fine: Number of points required in fine zone for full point-count confidence.
         min_points_coarse: Number of points required in coarse zone for full point-count confidence.
@@ -198,6 +218,7 @@ class TraversabilityParams:
     max_step: float = 0.10
     max_slope_deg: float = 15.0
     slope_baseline_m: float = 0.25
+    min_slope_dz_m: float = 0.03
     terrain_is_drivable: bool = False
     min_points_fine: int = 3
     min_points_coarse: int = 5
@@ -323,6 +344,14 @@ def compute_too_steep(zone: Any, params: TraversabilityParams) -> np.ndarray:
         gx[pos_x] = (zp_x[pos_x] - z_bar[pos_x]) / (d_pos_x[pos_x] * zone.cell_size)
         gx[neg_x] = (z_bar[neg_x] - zn_x[neg_x]) / (d_neg_x[neg_x] * zone.cell_size)
 
+        dz_x = np.zeros(shape, dtype=np.float32)
+        dz_x[both_x] = np.maximum(
+            np.abs(zp_x[both_x] - zn_x[both_x]),
+            np.maximum(np.abs(zp_x[both_x] - z_bar[both_x]), np.abs(zn_x[both_x] - z_bar[both_x]))
+        )
+        dz_x[pos_x] = np.abs(zp_x[pos_x] - z_bar[pos_x])
+        dz_x[neg_x] = np.abs(z_bar[neg_x] - zn_x[neg_x])
+
         # Y direction
         d_pos_y = np.zeros(shape, dtype=np.int32)
         d_neg_y = np.zeros(shape, dtype=np.int32)
@@ -352,16 +381,25 @@ def compute_too_steep(zone: Any, params: TraversabilityParams) -> np.ndarray:
         gy[pos_y] = (zp_y[pos_y] - z_bar[pos_y]) / (d_pos_y[pos_y] * zone.cell_size)
         gy[neg_y] = (z_bar[neg_y] - zn_y[neg_y]) / (d_neg_y[neg_y] * zone.cell_size)
 
+        dz_y = np.zeros(shape, dtype=np.float32)
+        dz_y[both_y] = np.maximum(
+            np.abs(zp_y[both_y] - zn_y[both_y]),
+            np.maximum(np.abs(zp_y[both_y] - z_bar[both_y]), np.abs(zn_y[both_y] - z_bar[both_y]))
+        )
+        dz_y[pos_y] = np.abs(zp_y[pos_y] - z_bar[pos_y])
+        dz_y[neg_y] = np.abs(z_bar[neg_y] - zn_y[neg_y])
+
+        max_dz = np.maximum(dz_x, dz_y)
         grad_mag = np.sqrt(gx * gx + gy * gy)
         slope = np.arctan(grad_mag)
-        too_steep = (slope > np.deg2rad(params.max_slope_deg)) & occupied
+        too_steep = (slope > np.deg2rad(params.max_slope_deg)) & (max_dz >= params.min_slope_dz_m) & occupied
     else:
         thresh_dz = np.float32(zone.cell_size * np.tan(np.deg2rad(params.max_slope_deg)))
         diff_v = np.abs(z_m[1:, :] - z_m[:-1, :])
-        both_v = (diff_v > thresh_dz) & occupied[1:, :] & occupied[:-1, :]
+        both_v = (diff_v > thresh_dz) & (diff_v >= params.min_slope_dz_m) & occupied[1:, :] & occupied[:-1, :]
 
         diff_h = np.abs(z_m[:, 1:] - z_m[:, :-1])
-        both_h = (diff_h > thresh_dz) & occupied[:, 1:] & occupied[:, :-1]
+        both_h = (diff_h > thresh_dz) & (diff_h >= params.min_slope_dz_m) & occupied[:, 1:] & occupied[:, :-1]
 
         too_steep = np.zeros(shape, dtype=bool)
         too_steep[1:, :] |= both_v
@@ -406,6 +444,7 @@ def _compute_zone_traversability(
             np.float32(params.max_step),
             np.float32(params.max_slope_deg),
             np.float32(params.slope_baseline_m),
+            np.float32(params.min_slope_dz_m),
             bool(params.terrain_is_drivable),
             int(min_points),
             np.float32(params.var_scale),

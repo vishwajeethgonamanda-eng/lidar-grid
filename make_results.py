@@ -531,7 +531,7 @@ When semantic labels are disabled and traversability is determined purely by phy
 
 ## 5. Road Row Diagnosis & Traversability Improvement (Class 1)
 
-Ground-truth Road and Parking cells (Class 1) were previously rejected at ~30.3% due to high-frequency LiDAR range noise ($\\sigma \\approx 2\\text{{ cm}}$) exceeding the 1.34 cm adjacent-cell slope threshold ($5\\text{{ cm}} \\times \\tan(15^\\circ)$). With the physical baseline slope filter (`slope_baseline_m = 0.25 m`), road agreement improved significantly.
+Ground-truth Road and Parking cells (Class 1) were previously rejected at ~30.3% due to high-frequency LiDAR range noise ($\\sigma \\approx 2\\text{{ cm}}$) exceeding the 1.34 cm adjacent-cell slope threshold ($5\\text{{ cm}} \\times \\tan(15^\\circ)$). With the physical baseline slope filter (`slope_baseline_m = 0.25 m`) and minimum height difference threshold (`min_slope_dz_m = 0.03 m`), road agreement improved significantly.
 
 ### Before vs. After Traversability Comparison
 | Metric / Attribute | Baseline (Immediate Adjacent Cells) | Physical Baseline Slope (`0.25 m`) | Improvement / Change |
@@ -569,11 +569,12 @@ Ground-truth Road and Parking cells (Class 1) were previously rejected at ~30.3%
 
 ### Pipeline Parameters & Implementation Details
 - **Physical Baseline (`slope_baseline_m`):** `0.25 m` (evaluates slope over ~5 cells for 5 cm grid).
+- **Minimum Slope Height Difference (`min_slope_dz_m`):** `0.03 m` (3 cm; requires absolute elevation difference $\\Delta z \\ge 3\\text{{ cm}}$ to an evaluated neighbour before triggering steep-slope rejection, preventing false rejections from sub-3 cm range noise while preserving true obstacle and ramp rejections).
 - **Normalized Box Filter:** NaN-aware $5 \\times 5$ cell window applied to the mean-z surface before central differences.
-- **Slope Angle Threshold (`max_slope_deg`):** `15.0°` ($\\tan(15^\\circ) \\approx 0.2679$). Cells where $\\text{{atan}}(\\text{{gradient magnitude}}) > 15^\\circ$ are marked `NON_DRIVABLE`.
+- **Slope Angle Threshold (`max_slope_deg`):** `15.0°` ($\\tan(15^\\circ) \\approx 0.2679$). Cells where $\\text{{atan}}(\\text{{gradient magnitude}}) > 15^\\circ$ AND $\\Delta z \\ge 3\\text{{ cm}}$ are marked `NON_DRIVABLE`.
 - **Step Height Threshold (`max_step`):** `0.10 m` ($\\Delta z = z_{{\\max}} - z_{{\\min}} > 0.10\\text{{ m}}$).
 - **Zone Seam Consistency:** Fine-grid boundary uses one-sided difference against available fine neighbors or coarse cell heights without boundary artefacts.
-- **Coarse Zone Behavior:** Cell size (0.50 m) already exceeds `0.25 m`, so coarse zone 4-neighbor slope evaluation is preserved unchanged.
+- **Coarse Zone Behavior:** Cell size (0.50 m) already exceeds `0.25 m`, so coarse zone 4-neighbor slope evaluation is preserved with the $\\Delta z \\ge 3\\text{{ cm}}$ requirement.
 
 ---
 
