@@ -78,7 +78,7 @@ def test_step_height_overrides_road_label():
 
 
 def test_slope_steep_vs_gentle():
-    params = TraversabilityParams(max_slope_deg=15.0)
+    params = TraversabilityParams(max_slope_deg=15.0, slope_baseline_m=0.05)
 
     # 1. Gentle ramp (e.g., 5 degrees):
     # dx = 0.05 m, dz for 5 deg is 0.05 * tan(5 deg) ~ 0.0044 m
@@ -151,3 +151,85 @@ def test_synthetic_kerb_seam_both_sides():
     # Coarse grid col ~ floor((10.0+100)/0.5)=220, row ~ 200
     coarse_kerb_states = res.coarse.state[198:202, 220:222]
     assert np.any(coarse_kerb_states == NON_DRIVABLE), "Coarse side kerb must have non-drivable cells"
+
+
+def test_flat_plane_with_2cm_noise_drivable():
+    """Flat ground plane with 2 cm range noise must achieve >= 98% DRIVABLE cells."""
+    rng = np.random.default_rng(42)
+    n_pts = 100000
+    x = rng.uniform(-8.0, 8.0, size=n_pts).astype(np.float32)
+    y = rng.uniform(-8.0, 8.0, size=n_pts).astype(np.float32)
+    z = rng.normal(0.0, 0.02, size=n_pts).astype(np.float32)
+    labels = np.ones(n_pts, dtype=np.int64)
+
+    grid = VarResGrid(n_classes=8)
+    grid.add_points(np.column_stack([x, y, z]), labels)
+    res = compute_traversability(grid, TraversabilityParams())
+
+    fine_occ = grid.fine.count > 0
+    fine_road = fine_occ & (grid.fine.dominant_label == 1)
+    fine_driv = fine_road & (res.fine.state == DRIVABLE)
+    driv_pct = np.count_nonzero(fine_driv) / np.count_nonzero(fine_road) * 100.0
+    assert driv_pct >= 98.0, f"Expected >= 98% drivable on flat plane + 2 cm noise, got {driv_pct:.2f}%"
+
+
+def test_ramp_20deg_nondrivable():
+    """A 20 degree ramp >= 8 m long must have >= 90% cells marked NON_DRIVABLE."""
+    rng = np.random.default_rng(42)
+    x_ramp = rng.uniform(1.0, 9.0, size=80000).astype(np.float32)
+    y_ramp = rng.uniform(-1.0, 1.0, size=80000).astype(np.float32)
+    z_ramp = (x_ramp * np.tan(np.deg2rad(20.0))).astype(np.float32)
+    labels_ramp = np.ones(len(x_ramp), dtype=np.int64)
+
+    grid_ramp = VarResGrid(n_classes=8)
+    grid_ramp.add_points(np.column_stack([x_ramp, y_ramp, z_ramp]), labels_ramp)
+    res_ramp = compute_traversability(grid_ramp, TraversabilityParams())
+
+    ramp_occ = grid_ramp.fine.count > 0
+    ramp_road = ramp_occ & (grid_ramp.fine.dominant_label == 1)
+    ramp_nd = ramp_road & (res_ramp.fine.state == NON_DRIVABLE)
+    nd_pct = np.count_nonzero(ramp_nd) / np.count_nonzero(ramp_road) * 100.0
+    assert nd_pct >= 90.0, f"Expected >= 90% non-drivable on 20 deg ramp, got {nd_pct:.2f}%"
+
+
+def test_kerb_12cm_flagged_by_step_rule():
+    """A 12 cm kerb step must be flagged NON_DRIVABLE by the step height rule."""
+    grid_kerb = VarResGrid(n_classes=8)
+    pts_kerb = np.array([
+        [2.02, 2.02, 0.00],
+        [2.02, 2.02, 0.00],
+        [2.02, 2.02, 0.12],
+        [2.02, 2.02, 0.12],
+    ], dtype=np.float32)
+    grid_kerb.add_points(pts_kerb, np.array([1, 1, 1, 1], dtype=np.int64))
+    res_kerb = compute_traversability(grid_kerb, TraversabilityParams(max_step=0.10))
+    col = int(np.floor((2.02 + 10.0) / 0.05))
+    row = int(np.floor((2.02 + 10.0) / 0.05))
+    assert res_kerb.fine.state[row, col] == NON_DRIVABLE
+
+
+def test_numba_vs_numpy_parity():
+    """Verifies complete parity between Numba kernel and NumPy fallback."""
+    import src.traversability as trav_mod
+    scan, labels = make_synthetic_scene(seed=42)
+    grid = VarResGrid(n_classes=8)
+    grid.add_points(scan[:, :3], labels)
+
+    params = TraversabilityParams()
+    res_nb = compute_traversability(grid, params)
+
+    orig_nb = trav_mod._HAS_NUMBA
+    try:
+        trav_mod._HAS_NUMBA = False
+        res_np = compute_traversability(grid, params)
+    finally:
+        trav_mod._HAS_NUMBA = orig_nb
+
+    np.testing.assert_array_equal(res_nb.fine.state, res_np.fine.state)
+    np.testing.assert_allclose(res_nb.fine.confidence, res_np.fine.confidence, atol=1e-5)
+    np.testing.assert_array_equal(res_nb.coarse.state, res_np.coarse.state)
+    np.testing.assert_allclose(res_nb.coarse.confidence, res_np.coarse.confidence, atol=1e-5)
+    assert len(res_nb.patches) == len(res_np.patches)
+    for p_nb, p_np in zip(res_nb.patches, res_np.patches):
+        np.testing.assert_array_equal(p_nb.state, p_np.state)
+        np.testing.assert_allclose(p_nb.confidence, p_np.confidence, atol=1e-5)

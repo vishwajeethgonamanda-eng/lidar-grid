@@ -11,7 +11,9 @@ from src.traversability import (
     OBSTACLE,
     NON_DRIVABLE,
     DRIVABLE,
+    _compute_zone_traversability,
 )
+import src.traversability as trav_mod
 
 
 def unoptimized_zone_traversability(
@@ -19,87 +21,13 @@ def unoptimized_zone_traversability(
     params: TraversabilityParams,
     min_points: int,
 ) -> TraversabilityResult:
-    """Original unoptimized reference implementation using float64 differences and rad2deg(arctan)."""
-    count = zone.count
-    shape = count.shape
-    occupied = count > 0
-
-    state = np.full(shape, UNKNOWN, dtype=np.int8)
-    confidence = np.zeros(shape, dtype=np.float32)
-
-    if not np.any(occupied):
-        return TraversabilityResult(state, confidence)
-
-    # 1. Compute Confidence
-    c_count = np.clip(count.astype(np.float32) / float(min_points), 0.0, 1.0)
-    z_var_safe = np.maximum(0.0, zone.z_var.astype(np.float32))
-    p_var = 1.0 / (1.0 + z_var_safe / float(params.var_scale))
-    confidence[occupied] = (c_count * p_var)[occupied]
-
-    # 2. Rule b: Dominant label in {3, 4, 5, 6} -> obstacle (3)
-    dom_label = zone.dominant_label
-    is_obstacle = np.isin(dom_label, [3, 4, 5, 6]) & occupied
-    state[is_obstacle] = OBSTACLE
-
-    # Remaining candidate cells to evaluate for drivability
-    candidates = occupied & (~is_obstacle)
-
-    # 3. Rule c: Step height = z_max - z_min > max_step -> non-drivable (2)
-    step_height = zone.z_max - zone.z_min
-    too_high_step = (step_height > params.max_step) & candidates
-
-    # 4. Rule d: Slope against 4 non-empty neighbours -> non-drivable (2)
-    z_m = zone.z_mean
-    dz_up = np.zeros(shape, dtype=np.float64)
-    dz_down = np.zeros(shape, dtype=np.float64)
-    dz_left = np.zeros(shape, dtype=np.float64)
-    dz_right = np.zeros(shape, dtype=np.float64)
-
-    valid_up = np.zeros(shape, dtype=bool)
-    valid_down = np.zeros(shape, dtype=bool)
-    valid_left = np.zeros(shape, dtype=bool)
-    valid_right = np.zeros(shape, dtype=bool)
-
-    dz_up[1:, :] = np.abs(z_m[1:, :] - z_m[:-1, :])
-    valid_up[1:, :] = occupied[1:, :] & occupied[:-1, :]
-
-    dz_down[:-1, :] = np.abs(z_m[:-1, :] - z_m[1:, :])
-    valid_down[:-1, :] = occupied[:-1, :] & occupied[1:, :]
-
-    dz_left[:, 1:] = np.abs(z_m[:, 1:] - z_m[:, :-1])
-    valid_left[:, 1:] = occupied[:, 1:] & occupied[:, :-1]
-
-    dz_right[:, :-1] = np.abs(z_m[:, :-1] - z_m[:, 1:])
-    valid_right[:, :-1] = occupied[:, :-1] & occupied[:, 1:]
-
-    dz_up = np.where(valid_up, dz_up, 0.0)
-    dz_down = np.where(valid_down, dz_down, 0.0)
-    dz_left = np.where(valid_left, dz_left, 0.0)
-    dz_right = np.where(valid_right, dz_right, 0.0)
-
-    max_dz = np.maximum(np.maximum(dz_up, dz_down), np.maximum(dz_left, dz_right))
-    steepest_slope_deg = np.rad2deg(np.arctan(max_dz / zone.cell_size))
-    too_steep_slope = (steepest_slope_deg > params.max_slope_deg) & candidates
-
-    # 5. Rule e: Dominant label 7 or 2
-    if params.terrain_is_drivable:
-        prohibited_label = (dom_label == 7) & candidates
-    else:
-        prohibited_label = ((dom_label == 7) | (dom_label == 2)) & candidates
-
-    is_non_drivable = too_high_step | too_steep_slope | prohibited_label
-    state[is_non_drivable] = NON_DRIVABLE
-
-    remaining = candidates & (~is_non_drivable)
-    if params.terrain_is_drivable:
-        is_drivable = ((dom_label == 1) | (dom_label == 2)) & remaining
-    else:
-        is_drivable = (dom_label == 1) & remaining
-
-    state[is_drivable] = DRIVABLE
-    state[remaining & (~is_drivable)] = NON_DRIVABLE
-
-    return TraversabilityResult(state, confidence)
+    """NumPy reference implementation using the NumPy traversability path."""
+    orig_numba = trav_mod._HAS_NUMBA
+    try:
+        trav_mod._HAS_NUMBA = False
+        return _compute_zone_traversability(zone, params, min_points)
+    finally:
+        trav_mod._HAS_NUMBA = orig_numba
 
 
 def unoptimized_process_frame_patches(xyz, labels, speed_mps=15.0, k_patches=4, params=None):
