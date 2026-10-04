@@ -154,6 +154,46 @@ def _draw_topdown_car_icon(draw: ImageDraw.ImageDraw, center: int = 400, scale: 
         draw.polygon(poly_px, fill=fill, outline=outline)
 
 
+def _draw_motion_cues_topdown(
+    draw: ImageDraw.ImageDraw,
+    s_dist: float,
+    canvas_size: int,
+    scale: float,
+    center: int,
+) -> None:
+    """Draws faint lane-distance ticks every 10m in world coordinates.
+
+    As the car advances by s_dist along the road, the ticks scroll backward
+    (downwards in ego top-down coordinates), providing clear visual motion cues.
+    """
+    k_min = int(np.floor((s_dist - 90.0) / 10.0))
+    k_max = int(np.ceil((s_dist + 90.0) / 10.0))
+
+    tick_color = (80, 95, 120)       # Faint slate-blue
+    edge_color = (95, 112, 140)      # Slightly brighter lane edge tick
+    text_color = (90, 110, 135)
+
+    # Road corridor bounds for lane ticks: lateral y from -3.5m to +3.5m
+    y_half = 3.5
+    px_left = int(center - y_half * scale)
+    px_right = int(center + y_half * scale)
+
+    for k in range(k_min, k_max + 1):
+        x_world = k * 10.0
+        x_local = x_world - s_dist
+        if -90.0 <= x_local <= 90.0:
+            py = int(np.round(center - x_local * scale))
+            if 10 <= py < canvas_size - 10:
+                # Transverse lane tick
+                draw.line([(px_left, py), (px_right, py)], fill=tick_color, width=1)
+                # Small boundary tick marks (perpendicular markers at lane edges)
+                draw.line([(px_left, py - 3), (px_left, py + 3)], fill=edge_color, width=1)
+                draw.line([(px_right, py - 3), (px_right, py + 3)], fill=edge_color, width=1)
+                # Faint world distance label next to the right edge
+                lbl = f"{int(round(x_world))}m"
+                draw.text((px_right + 5, py - 6), lbl, fill=text_color, font=_FONT_LABEL)
+
+
 def render_grid_map(
     grid: VarResGrid,
     trav: TraversabilityMap,
@@ -161,17 +201,19 @@ def render_grid_map(
     canvas_size: int = 800,
     sensing_mode: str = "Pulse",
     current_time: float = 0.0,
+    s_dist: float = 0.0,
+    motion_cues: bool = False,
 ) -> np.ndarray:
     """Renders a composite bird's-eye view raster map where +x is forward (pointing UP)
     and +y is lateral (pointing RIGHT).
     
-    Fast vectorized mapping: coarse grid expanded by 2x, non-empty fine-zone and focus patch
+    Fast vectorized mapping: coarse grid expanded to canvas size, non-empty fine-zone and focus patch
     cells stamped directly into the buffer, range rings and annotations overlaid via PIL.
     """
-    scale = canvas_size / 200.0  # 4.0 px/m for 800x800 canvas covering [-100, 100] m
+    scale = canvas_size / 200.0  # px/m covering [-100, 100] m
     center = canvas_size // 2
 
-    # 1. Base Coarse Zone (400x400 cells at 0.5m = 2x2 px per cell)
+    # 1. Base Coarse Zone (400x400 cells at 0.5m)
     if view_mode == "state":
         # trav.coarse.state shape: (400, 400) where row is y, col is x
         c_state = trav.coarse.state
@@ -183,12 +225,12 @@ def render_grid_map(
         c_colors[c_cnt == 0] = UNKNOWN_COLOR
 
     # Map to screen: col is x (forward is UP -> flip vertically), row is y (lateral is RIGHT)
-    # coarse array has indexing coarse[row_y, col_x].
-    # Screen has row_px (along -x), col_px (along +y).
-    # transpose(1, 0, 2) turns [y, x] into [x, y].
-    # flip along axis 0 turns +x (col 399) to row_px 0 (top of image).
     screen_coarse = np.flip(c_colors.transpose(1, 0, 2), axis=0)
-    img = np.repeat(np.repeat(screen_coarse, 2, axis=0), 2, axis=1)
+    if canvas_size == 800:
+        img = np.repeat(np.repeat(screen_coarse, 2, axis=0), 2, axis=1)
+    else:
+        idx = (np.arange(canvas_size) * (400.0 / canvas_size)).astype(np.int64)
+        img = screen_coarse[idx[:, None], idx].copy()
 
     # 2. Render Focus Patches (over coarse, 64x64 at 5cm)
     if hasattr(grid, "patches") and grid.patches:
@@ -250,9 +292,13 @@ def render_grid_map(
     if _HAS_NUMBA:
         _mask_outside_circle_numba(img, 20, 22, 28)
     else:
-        img[_MASK_OUTSIDE_100M] = BG_COLOR
+        rows, cols = img.shape[:2]
+        cr, cc = rows // 2, cols // 2
+        gy, gx = np.ogrid[:rows, :cols]
+        mask = (gx - cc) ** 2 + (gy - cr) ** 2 >= cr ** 2
+        img[mask] = BG_COLOR
 
-    # 5. PIL Vector Overlay: Range Rings, Fine-Zone Ring, Focus Patches, Car Icon, Labels
+    # 5. PIL Vector Overlay: Range Rings, Fine-Zone Ring, Focus Patches, Motion Cues, Car Icon, Labels
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
     font_ring = _FONT_RING
@@ -301,7 +347,11 @@ def render_grid_map(
             draw.rectangle([(tag_x, tag_y), (tag_x + 88, tag_y + 17)], fill=(25, 25, 12, 230), outline=(255, 215, 0))
             draw.text((tag_x + 4, tag_y + 1), "focus patch", fill=(255, 215, 0), font=font_label)
 
-    # 6. Sensing rings on ground under car (localized bbox alpha-composite)
+    # 6. Motion Cues (faint lane distance ticks in world coordinates)
+    if motion_cues:
+        _draw_motion_cues_topdown(draw, s_dist=s_dist, canvas_size=canvas_size, scale=scale, center=center)
+
+    # 7. Sensing rings on ground under car (localized bbox alpha-composite)
     if sensing_mode != "Off":
         rings = compute_sensing_rings(mode=sensing_mode, current_time=current_time)
         if rings:
@@ -333,7 +383,7 @@ def render_grid_map(
                 pil_img.paste(comp_sub, (u_min, v_min))
                 draw = ImageDraw.Draw(pil_img)
 
-    # 7. Top-down Car Icon at origin
+    # 8. Top-down Car Icon at origin
     _draw_topdown_car_icon(draw, center=center, scale=scale)
 
     return np.asarray(pil_img)
@@ -345,9 +395,11 @@ def render_raw_points(
     canvas_size: int = 800,
     sensing_mode: str = "Pulse",
     current_time: float = 0.0,
+    s_dist: float = 0.0,
+    motion_cues: bool = False,
 ) -> np.ndarray:
     """Renders a fast top-down scatter of raw LiDAR points (x forward / up, y lateral)
-    with circular 100m range rings, alternating vehicle tints, sensing pulse, and ego car icon.
+    with circular 100m range rings, alternating vehicle tints, sensing pulse, motion cues, and ego car icon.
     """
     scale = canvas_size / 200.0
     center = canvas_size // 2
@@ -401,9 +453,13 @@ def render_raw_points(
     if _HAS_NUMBA:
         _mask_outside_circle_numba(img, 20, 22, 28)
     else:
-        img[_MASK_OUTSIDE_100M] = BG_COLOR
+        rows, cols = img.shape[:2]
+        cr, cc = rows // 2, cols // 2
+        gy, gx = np.ogrid[:rows, :cols]
+        mask = (gx - cc) ** 2 + (gy - cr) ** 2 >= cr ** 2
+        img[mask] = BG_COLOR
 
-    # PIL Annotations: Range rings, Sensing Rings & car icon
+    # PIL Annotations: Range rings, Motion Cues, Sensing Rings & car icon
     pil_img = Image.fromarray(img)
     draw = ImageDraw.Draw(pil_img)
     font_ring = _FONT_RING
@@ -415,6 +471,10 @@ def render_raw_points(
         lbl_y = center - 8
         draw.rectangle([(lbl_x - 3, lbl_y - 2), (lbl_x + 36, lbl_y + 16)], fill=(16, 18, 24, 230), outline=(50, 55, 68))
         draw.text((lbl_x + 2, lbl_y - 1), f"{r}m", fill=(200, 208, 222), font=font_ring)
+
+    # Motion Cues (faint lane distance ticks in world coordinates)
+    if motion_cues:
+        _draw_motion_cues_topdown(draw, s_dist=s_dist, canvas_size=canvas_size, scale=scale, center=center)
 
     # Sensing rings on ground under car (localized bbox alpha-composite)
     if sensing_mode != "Off":
@@ -456,10 +516,13 @@ def render_25d_fast(
     grid: VarResGrid,
     trav: TraversabilityMap,
     view_range: str = "Road corridor",
-    canvas_size: Tuple[int, int] = (800, 800),
+    canvas_size: Union[int, Tuple[int, int]] = (800, 800),
     max_cells: int = 25000,
     sensing_mode: str = "Pulse",
     current_time: float = 0.0,
+    h_exaggeration: float = 3.0,
+    s_dist: float = 0.0,
+    motion_cues: bool = False,
 ) -> np.ndarray:
     """Renders a fast pseudo-3D perspective road corridor view using NumPy and painter's algorithm.
     
@@ -468,7 +531,10 @@ def render_25d_fast(
     orange non-drivable, red obstacle). 3D ego crossover model and sensing rings rendered at origin.
     Runs in under 25 ms.
     """
-    canvas_h, canvas_w = canvas_size
+    if isinstance(canvas_size, int):
+        canvas_h, canvas_w = canvas_size, canvas_size
+    else:
+        canvas_h, canvas_w = canvas_size
     img = np.full((canvas_h, canvas_w, 3), (16, 18, 24), dtype=np.uint8)
 
     # 1. Gather all non-empty cells across fine, patches, and coarse zones
@@ -681,10 +747,29 @@ def render_25d_fast(
                         ov_draw.polygon(poly_offset, fill=fill_rgba, outline=edge_rgba)
                     sub_crop = pil_img.crop((u_min, v_min, u_max, v_max)).convert("RGBA")
                     comp_sub = Image.alpha_composite(sub_crop, overlay_sub).convert("RGB")
-                    pil_img.paste(comp_sub, (u_min, v_min))
-                    draw = ImageDraw.Draw(pil_img)
+    # 5. Motion Cues in 3D Perspective
+    if motion_cues:
+        k_min = int(np.floor(s_dist / 10.0))
+        k_max = int(np.ceil((s_dist + 60.0) / 10.0))
+        tick_col = (80, 95, 120)
+        for k in range(k_min, k_max + 1):
+            x_world = k * 10.0
+            x_local = x_world - s_dist
+            if 0.5 <= x_local <= 60.0:
+                x_rel = x_local - xc
+                x_cam = x_rel * cos_p - (-zc) * sin_p
+                z_cam = x_rel * sin_p + (-zc) * cos_p
+                if x_cam > 1.0:
+                    u_left = cu + fu * (-3.5 / x_cam)
+                    v_left = cv - fv * (z_cam / x_cam)
+                    u_right = cu + fu * (3.5 / x_cam)
+                    v_right = cv - fv * (z_cam / x_cam)
+                    if 0 <= v_left < canvas_h and 0 <= v_right < canvas_h:
+                        draw.line([(u_left, v_left), (u_right, v_right)], fill=tick_col, width=1)
+                        lbl = f"{int(round(x_world))}m"
+                        draw.text((u_right + 4, v_right - 6), lbl, fill=(90, 110, 135), font=_FONT_LABEL)
 
-    # 5. Project and Draw 3D Ego Crossover Model at Origin using precached car mesh
+    # 6. Project and Draw 3D Ego Crossover Model at Origin using precached car mesh
     v_car = _CAR_MESH_VERTICES
     f_car = _CAR_MESH_FACES
     c_car = _CAR_MESH_COLORS

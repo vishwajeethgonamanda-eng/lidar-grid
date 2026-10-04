@@ -1,9 +1,18 @@
+import io
+import os
 from pathlib import Path
 import time
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
+
+
+def compress_jpeg(img_array: np.ndarray, quality: int = 70) -> bytes:
+    """Encodes an RGB uint8 array to compressed JPEG bytes in memory."""
+    buf = io.BytesIO()
+    Image.fromarray(img_array).save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 from src.grid_engine import (
     VarResGrid,
@@ -160,7 +169,7 @@ Traversability Time:    {timings.get('compute_traversability_ms', 0.0):6.2f} ms
 Display Draw Time:      {disp_time_ms:6.2f} ms
 Patch Extra Latency:    {extra_lat:6.2f} ms
 Pipeline Rate:          {pipe_ms:6.2f} ms ({pipe_fps:5.1f} FPS)
-Display Rate:           {disp_time_ms:6.2f} ms ({disp_fps:5.1f} FPS)
+Delivered FPS:          {disp_fps:5.1f} FPS
 ```"""
 
 
@@ -190,7 +199,7 @@ def format_telemetry_html(
         <div style="font-size: 11px; color: #8c93a4;">{pipe_ms:.1f} ms</div>
       </div>
       <div style="background: #191c24; padding: 8px 12px; border-radius: 6px; border: 1px solid #2e3342;">
-        <div style="font-size: 11px; color: #8c93a4; text-transform: uppercase;">Display FPS</div>
+        <div style="font-size: 11px; color: #8c93a4; text-transform: uppercase;">Delivered FPS</div>
         <div style="font-size: 20px; font-weight: 700; color: #38bdf8;">{disp_fps:.1f}</div>
         <div style="font-size: 11px; color: #8c93a4;">{disp_ms:.1f} ms draw</div>
       </div>
@@ -386,19 +395,43 @@ def main():
 
     fine_cell_size = (2.0 * fine_radius) / 400.0
 
+    # Cloud / Hosted Mode Detection & Settings
+    cloud_detected = Path("/mount/src").exists() or bool(os.environ.get("STREAMLIT_RUNTIME_ENV"))
+    hosted_mode = st.sidebar.checkbox("Hosted mode", value=cloud_detected)
+    if hosted_mode:
+        st.sidebar.info(
+            "**Hosted mode active:**\n"
+            "- Canvas size: 640 px (reduced from 800 px)\n"
+            "- Delivery target: 6 fps (adjusted from 10 fps)\n"
+            "- Focus patches: capped at 2\n"
+            "- Single view only (side-by-side disabled)"
+        )
+
+    cur_canvas = 640 if hosted_mode else 800
+    target_fps = 6.0 if hosted_mode else 10.0
+    frame_interval = 1.0 / target_fps
+    jpeg_quality = 70 if hosted_mode else 85
+
     # Risk Focus Patches Controls
     st.sidebar.header("Focus Patches")
     patches_enabled = st.sidebar.checkbox("Risk-Guided Focus Patches", value=True)
     if patches_enabled:
-        k_patches = st.sidebar.slider("Max Patches (K)", min_value=1, max_value=8, value=4)
+        max_patches = 2 if hosted_mode else 8
+        default_patches = min(4, max_patches)
+        k_patches = st.sidebar.slider("Max Patches (K)", min_value=1, max_value=max_patches, value=default_patches)
     else:
         k_patches = 0
 
     # Display Options
     st.sidebar.header("Display Options")
+    motion_cues = st.sidebar.checkbox("Motion cues", value=True)
+    if hosted_mode:
+        view_layouts = ["Grid map", "Raw points", "2.5D elevation map"]
+    else:
+        view_layouts = ["Grid map", "Raw points", "Side by side", "2.5D elevation map"]
     view_layout = st.sidebar.radio(
         "View Layout",
-        ["Grid map", "Raw points", "Side by side", "2.5D elevation map"],
+        view_layouts,
         index=0,
     )
     if view_layout != "2.5D elevation map":
@@ -480,6 +513,7 @@ def main():
             view_right_ph = None
 
         caption_ph = st.empty()
+        status_ph = st.empty()
         info_ph = st.empty()
 
     with col_info:
@@ -584,14 +618,16 @@ def main():
 
     # Mode 1: Active Playback using while loop with fast rasters (NO st.rerun, NO fragment)
     if st.session_state.playing:
-        FRAME_INTERVAL = 0.100  # 10 Hz target
-        last_disp_time = 0.0
+        delivery_history = []
+        t_prev_frame = time.perf_counter()
 
         while st.session_state.playing:
             t_loop_0 = time.perf_counter()
 
-            # Advance state
-            st.session_state.s += float(speed_mps) * 0.1
+            # Advance state by real elapsed dt (capped at 0.25 s)
+            dt = min(max(t_loop_0 - t_prev_frame, 0.001), 0.25)
+            t_prev_frame = t_loop_0
+            st.session_state.s += float(speed_mps) * dt
             st.session_state.frame_idx = (st.session_state.frame_idx + 1) % max(1, num_frames)
 
             # Pipeline execution
@@ -612,30 +648,86 @@ def main():
             curr_time = time.time()
 
             if view_layout == "Grid map":
-                img = render_grid_map(grid, trav, view_mode=mode_key, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
-                view_ph.image(img, width="stretch", output_format="JPEG", clamp=True)
+                img = render_grid_map(
+                    grid,
+                    trav,
+                    view_mode=mode_key,
+                    canvas_size=cur_canvas,
+                    sensing_mode=sensing_mode,
+                    current_time=curr_time,
+                    s_dist=st.session_state.s,
+                    motion_cues=motion_cues,
+                )
+                img_bytes = compress_jpeg(img, quality=jpeg_quality)
+                view_ph.image(img_bytes, width="stretch", clamp=True)
                 caption_text = f"Top-Down 200m Grid Map | Fine r={fine_radius:.0f}m ({fine_cell_size*100:.1f}cm) | {n_patches} Focus Patches @ 5cm"
             elif view_layout == "Raw points":
-                img = render_raw_points(xyz, labels, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
-                view_ph.image(img, width="stretch", output_format="JPEG", clamp=True)
+                img = render_raw_points(
+                    xyz,
+                    labels,
+                    canvas_size=cur_canvas,
+                    sensing_mode=sensing_mode,
+                    current_time=curr_time,
+                    s_dist=st.session_state.s,
+                    motion_cues=motion_cues,
+                )
+                img_bytes = compress_jpeg(img, quality=jpeg_quality)
+                view_ph.image(img_bytes, width="stretch", clamp=True)
                 caption_text = f"Raw Points ({min(len(xyz), 25000):,} Subsampled Points, Semantic Classes)"
             elif view_layout == "Side by side":
-                map_img = render_grid_map(grid, trav, view_mode=mode_key, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
-                raw_img = render_raw_points(xyz, labels, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
-                view_left_ph.image(map_img, width="stretch", output_format="JPEG", clamp=True)
-                view_right_ph.image(raw_img, width="stretch", output_format="JPEG", clamp=True)
+                map_img = render_grid_map(
+                    grid,
+                    trav,
+                    view_mode=mode_key,
+                    canvas_size=cur_canvas,
+                    sensing_mode=sensing_mode,
+                    current_time=curr_time,
+                    s_dist=st.session_state.s,
+                    motion_cues=motion_cues,
+                )
+                raw_img = render_raw_points(
+                    xyz,
+                    labels,
+                    canvas_size=cur_canvas,
+                    sensing_mode=sensing_mode,
+                    current_time=curr_time,
+                    s_dist=st.session_state.s,
+                    motion_cues=motion_cues,
+                )
+                map_bytes = compress_jpeg(map_img, quality=jpeg_quality)
+                raw_bytes = compress_jpeg(raw_img, quality=jpeg_quality)
+                view_left_ph.image(map_bytes, width="stretch", clamp=True)
+                view_right_ph.image(raw_bytes, width="stretch", clamp=True)
                 caption_text = f"Left: 2.5D Grid Map | Right: Raw Points ({min(len(xyz), 25000):,} pts)"
             else:  # "2.5D elevation map"
-                img_25d = render_25d_fast(grid, trav, view_range=view_range, canvas_size=(800, 800), sensing_mode=sensing_mode, current_time=curr_time)
-                view_ph.image(img_25d, width="stretch", output_format="JPEG", clamp=True)
+                img_25d = render_25d_fast(
+                    grid,
+                    trav,
+                    view_range=view_range,
+                    canvas_size=(cur_canvas, cur_canvas),
+                    sensing_mode=sensing_mode,
+                    current_time=curr_time,
+                    h_exaggeration=h_exaggeration,
+                    s_dist=st.session_state.s,
+                    motion_cues=motion_cues,
+                )
+                img_bytes = compress_jpeg(img_25d, quality=jpeg_quality)
+                view_ph.image(img_bytes, width="stretch", clamp=True)
                 caption_text = f"Fast 2.5D Road Perspective (<30ms) | Range: {view_range} | Height: {h_exaggeration:.1f}x"
 
             t_draw_1 = time.perf_counter()
             disp_time_ms = max((t_draw_1 - t_draw_0) * 1000.0, 0.001)
-            disp_fps = 1000.0 / max(0.001, t_draw_1 - last_disp_time) if last_disp_time > 0.0 else 10.0
-            last_disp_time = t_draw_1
+
+            # Measure delivered frames over rolling 2-second window
+            delivery_history.append(t_draw_1)
+            delivery_history = [t for t in delivery_history if t_draw_1 - t <= 2.0]
+            if len(delivery_history) > 1 and (delivery_history[-1] - delivery_history[0]) > 0.05:
+                delivered_fps = (len(delivery_history) - 1) / (delivery_history[-1] - delivery_history[0])
+            else:
+                delivered_fps = target_fps
 
             caption_ph.caption(caption_text)
+            status_ph.caption(f"Delivered {delivered_fps:.1f} fps (target {int(target_fps)})")
 
             # Update comparison and stats
             num_raw = len(xyz)
@@ -667,14 +759,14 @@ def main():
                 timings=timings,
                 disp_time_ms=disp_time_ms,
                 pipe_fps=pipe_fps,
-                disp_fps=disp_fps,
+                disp_fps=delivered_fps,
             )
             stats_ph.markdown(stats_md)
 
             telemetry_html = format_telemetry_html(
                 pipe_fps=pipe_fps,
                 pipe_ms=pipe_ms,
-                disp_fps=disp_fps,
+                disp_fps=delivered_fps,
                 disp_ms=disp_time_ms,
                 fine_radius=fine_radius,
                 fine_cell_size=fine_cell_size,
@@ -704,13 +796,13 @@ def main():
 | **traversability** | {t_trav:.2f} ms |
 | **Display Draw** | {disp_time_ms:.2f} ms |
 | **Pipeline Rate** | {pipe_ms:.2f} ms ({pipe_fps:.1f} FPS) |
-| **Display Rate** | {disp_time_ms:.2f} ms ({disp_fps:.1f} FPS) |
+| **Delivered FPS** | {delivered_fps:.1f} FPS |
 """
             timings_ph.markdown(timings_md)
 
-            # Maintain strict 10 Hz target
+            # Maintain strict delivery target
             loop_elapsed = time.perf_counter() - t_loop_0
-            rem_sleep = FRAME_INTERVAL - loop_elapsed
+            rem_sleep = frame_interval - loop_elapsed
             if rem_sleep > 0:
                 time.sleep(rem_sleep)
 
@@ -731,7 +823,16 @@ def main():
         t_draw_0 = time.perf_counter()
         curr_time = time.time()
         if view_layout == "Grid map":
-            img = render_grid_map(grid, trav, view_mode=mode_key, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
+            img = render_grid_map(
+                grid,
+                trav,
+                view_mode=mode_key,
+                canvas_size=cur_canvas,
+                sensing_mode=sensing_mode,
+                current_time=curr_time,
+                s_dist=st.session_state.s,
+                motion_cues=motion_cues,
+            )
             fig = go.Figure(data=[go.Image(z=img)])
             fig.update_layout(
                 margin=dict(l=0, r=0, t=0, b=0),
@@ -745,7 +846,15 @@ def main():
             view_ph.plotly_chart(fig, key="chart_grid", width="stretch")
             caption_text = f"Top-Down 200m Grid Map (Interactive) | Fine r={fine_radius:.0f}m ({fine_cell_size*100:.1f}cm) | {n_patches} Patches"
         elif view_layout == "Raw points":
-            img = render_raw_points(xyz, labels, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
+            img = render_raw_points(
+                xyz,
+                labels,
+                canvas_size=cur_canvas,
+                sensing_mode=sensing_mode,
+                current_time=curr_time,
+                s_dist=st.session_state.s,
+                motion_cues=motion_cues,
+            )
             fig = go.Figure(data=[go.Image(z=img)])
             fig.update_layout(
                 margin=dict(l=0, r=0, t=0, b=0),
@@ -759,8 +868,25 @@ def main():
             view_ph.plotly_chart(fig, key="chart_raw", width="stretch")
             caption_text = f"Raw Points (Interactive) ({min(len(xyz), 25000):,} Subsampled Points, Semantic Classes)"
         elif view_layout == "Side by side":
-            map_img = render_grid_map(grid, trav, view_mode=mode_key, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
-            raw_img = render_raw_points(xyz, labels, canvas_size=800, sensing_mode=sensing_mode, current_time=curr_time)
+            map_img = render_grid_map(
+                grid,
+                trav,
+                view_mode=mode_key,
+                canvas_size=cur_canvas,
+                sensing_mode=sensing_mode,
+                current_time=curr_time,
+                s_dist=st.session_state.s,
+                motion_cues=motion_cues,
+            )
+            raw_img = render_raw_points(
+                xyz,
+                labels,
+                canvas_size=cur_canvas,
+                sensing_mode=sensing_mode,
+                current_time=curr_time,
+                s_dist=st.session_state.s,
+                motion_cues=motion_cues,
+            )
             fig_l = go.Figure(data=[go.Image(z=map_img)])
             fig_l.update_layout(
                 margin=dict(l=0, r=0, t=0, b=0),
@@ -806,8 +932,9 @@ def main():
 
         t_draw_1 = time.perf_counter()
         disp_time_ms = max((t_draw_1 - t_draw_0) * 1000.0, 0.001)
-        disp_fps = 1000.0 / disp_time_ms
+        disp_fps = target_fps
         caption_ph.caption(caption_text)
+        status_ph.caption(f"Delivered {target_fps:.1f} fps (target {int(target_fps)})")
 
         num_raw = len(xyz)
         non_empty_fine = int(np.count_nonzero(grid.fine.count > 0))
@@ -874,7 +1001,7 @@ def main():
 | **traversability** | {t_trav:.2f} ms |
 | **Display Draw** | {disp_time_ms:.2f} ms |
 | **Pipeline Rate** | {pipe_ms:.2f} ms ({pipe_fps:.1f} FPS) |
-| **Display Rate** | {disp_time_ms:.2f} ms ({disp_fps:.1f} FPS) |
+| **Delivered FPS** | {disp_fps:.1f} FPS |
 """
         timings_ph.markdown(timings_md)
 
